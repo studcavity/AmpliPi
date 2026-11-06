@@ -66,12 +66,15 @@ if [ -z "$pass" ]; then
   gen_pass_phrase
 fi
 
-# Store new password
-mkdir -p $confdir
-echo $pass > $confdir/default_password.txt
-
-# Change the pi user's password to the new default password
+# Change the pi user's password first, and only record it once that has worked: the front display
+# shows default_password.txt, and amplipi-firstboot.sh treats the file's existence as "already
+# done" - writing it first would show (and keep) a password that was never actually set.
 if ! echo "pi:$pass" | sudo chpasswd; then
   echo "ERROR: Setting password failed."
   exit 2
 fi
+
+# Store new password
+mkdir -p $confdir
+echo "$pass" > "$confdir/default_password.txt.tmp"
+mv "$confdir/default_password.txt.tmp" "$confdir/default_password.txt"

@@ -422,7 +422,9 @@ _os_deps: Dict[str, Dict[str, Any]] = {
             # Lyrion ships a single architecture-independent package (suffixed "_all"), not
             # separate arm/arm64 builds - confirmed against the actual downloads server; a prior
             # arm64-suffixed URL here never resolved to anything real.
-            'if [ ! $(dpkg-query --show --showformat=\'${Status}\' lyrionmusicserver | grep -q installed) ]; then '
+            # `[ ! $(... | grep -q ...) ]` was always true (grep -q prints nothing, so the test saw an
+            # empty string) - LMS got re-downloaded and reinstalled on every run. Test grep's status.
+            'if ! dpkg-query --show --showformat=\'${Status}\' lyrionmusicserver 2>/dev/null | grep -q "install ok installed"; then '
             '  wget -nv https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_all.deb -O /tmp/lyrionmusicserver_9.1.1.deb',
             '  sudo dpkg -i /tmp/lyrionmusicserver_9.1.1.deb',
             '  if [ ! -e /data/.config/amplipi/lms_mode ] ; then sudo systemctl disable lyrionmusicserver; fi',
@@ -918,8 +920,9 @@ def _install_os_deps(env, progress, with_alsa, deps=_os_deps.keys(), dep_filter:
         'systemctl --user mask pulseaudio.service'.split(),
     ]).run()])
     # serial port permission granting
-    tasks.append(Task('Check serial permissions', 'groups'.split()).run())
-    tasks[-1].success = 'pi' in tasks[-1].output
+    tasks.append(Task('Check serial permissions', 'groups pi'.split()).run())
+    # Was `'pi' in output`, which is always true (pi is in its own group) - check for dialout.
+    tasks[-1].success = 'dialout' in tasks[-1].output.split()
     if not tasks[-1].success:
       tasks += print_progress([Task("Giving pi serial permission. !!!AmpliPi will need to be restarted after this!!!",
                               "sudo gpasswd -a pi dialout".split()).run()])
@@ -948,8 +951,16 @@ def _install_os_deps(env, progress, with_alsa, deps=_os_deps.keys(), dep_filter:
   # risk breaking whatever it already owns).
   tasks += print_progress([Task(
       "pre-create squeezeboxserver with a pinned UID",
+      # If 105 is already taken on this image, don't abort the whole install over it: fall back to
+      # a system-assigned UID. The `chown -R squeezeboxserver:nogroup /data/lms` in the lms deps
+      # re-stamps /data/lms by name on every deploy, so a different UID still self-heals.
       args='if ! id squeezeboxserver >/dev/null 2>&1; then '
-           '  sudo useradd --system --uid 105 --gid nogroup --no-create-home --shell /usr/sbin/nologin squeezeboxserver; '
+           '  if getent passwd 105 >/dev/null; then '
+           '    echo "UID 105 is taken by $(getent passwd 105 | cut -d: -f1), letting useradd pick one"; '
+           '    sudo useradd --system --gid nogroup --no-create-home --shell /usr/sbin/nologin squeezeboxserver; '
+           '  else '
+           '    sudo useradd --system --uid 105 --gid nogroup --no-create-home --shell /usr/sbin/nologin squeezeboxserver; '
+           '  fi; '
            'fi',
       shell=True).run()])
 
@@ -1402,6 +1413,10 @@ def _configure_authbind() -> List[Task]:
 def _api_key() -> Optional[str]:
   """ Get a singular API key for use with the updater """
   user_file_path = os.path.join('/data', '.config', 'amplipi', 'users.json')
+  if not os.path.exists(user_file_path):
+    # Pre-A/B (Buster-era) units keep it in the home dir - needed by _legacy_layout_guard to ask a
+    # password-protected legacy unit which version it was running.
+    user_file_path = os.path.join(os.path.expanduser('~'), '.config', 'amplipi', 'users.json')
   try:
     with open(user_file_path, encoding='utf-8') as user_file:
       users = json.load(user_file)
@@ -1665,12 +1680,103 @@ def add_tests(env, progress) -> List[Task]:
   return tasks
 
 
+LEGACY_REPO_TARBALL = 'https://github.com/micro-nova/AmpliPi/archive/refs/tags/{tag}.tar.gz'
+
+
+def _is_legacy_layout() -> bool:
+  """ True on a pre-A/B (Buster-era, 2-partition) AmpliPi. This release only runs on the A/B
+  layout: it needs BOOT_SLOT on the kernel cmdline and /data on p7. """
+  if 'amplipi' not in platform.node():
+    return False
+  try:
+    with open('/proc/cmdline', encoding='utf-8') as f:
+      cmdline = f.read()
+  except OSError:
+    return False
+  return 'BOOT_SLOT=' not in cmdline and not os.path.exists('/dev/mmcblk0p7')
+
+
+def _tar_member_files(tarball: str) -> set:
+  """ Regular-file paths in a GitHub source tarball, relative to its single top-level dir """
+  import tarfile  # pylint: disable=import-outside-toplevel
+  with tarfile.open(tarball) as tar:
+    return {m.name.split('/', 1)[1] for m in tar.getmembers() if m.isfile() and '/' in m.name}
+
+
+def _rollback_legacy_install(base_dir: str) -> Tuple[bool, str]:
+  """ The 0.4.x web updater has already cp -a'd this release over base_dir by the time it imports
+  this script, so just refusing to configure isn't enough: on the next reboot the old services
+  would start this release's code, which looks for its config under /data (which doesn't exist on
+  this layout) and can't be fixed over the web. Put the previously running release back instead. """
+  ver_task = _check_version('http://0.0.0.0/api')
+  match = re.search(r'version=(\d+\.\d+\.\d+\S*)', str(ver_task.output))
+  if not match:
+    return False, 'could not determine the previously running version from the API'
+  prev = match.group(1)
+  tmp = tempfile.mkdtemp(prefix='amplipi-rollback-')
+  try:
+    old_tar = os.path.join(tmp, 'previous.tar.gz')
+    resp = requests.get(LEGACY_REPO_TARBALL.format(tag=prev), stream=True, timeout=(10, 60))
+    resp.raise_for_status()
+    with open(old_tar, 'wb') as f:
+      for chunk in resp.iter_content(chunk_size=1024 * 1024):
+        f.write(chunk)
+    old_files = _tar_member_files(old_tar)
+
+    # Remove files this release added that the previous one never had (e.g. new modules), so the
+    # restored tree matches the previous release instead of a mix of both. Only possible when the
+    # updater's copy of the new tarball is still around; harmless leftovers otherwise.
+    new_tar = os.path.join(base_dir, 'web', 'uploads', 'update.tar.gz')
+    if os.path.exists(new_tar):
+      for rel in _tar_member_files(new_tar) - old_files:
+        path = os.path.join(base_dir, rel)
+        if os.path.isfile(path) or os.path.islink(path):
+          os.remove(path)
+
+    extract_dir = os.path.join(tmp, 'src')
+    os.makedirs(extract_dir)
+    subprocess.run(['tar', '-xf', old_tar, '--directory', extract_dir], check=True)
+    (top,) = os.listdir(extract_dir)
+    src = os.path.join(extract_dir, top)
+    subprocess.run(['cp', '-a', *glob.glob(f'{src}/*'), f'{base_dir}/'], check=True)
+    subprocess.run(f'find {base_dir}/amplipi -name __pycache__ -type d -exec rm -rf {{}} +', shell=True, check=False)
+    return True, prev
+  except Exception as e:  # pylint: disable=broad-except
+    return False, f'{prev}: {e}'
+  finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _legacy_layout_guard(development: bool, ci_mode: bool, progress) -> bool:
+  """ Returns True if install() may proceed. Must run before install() touches anything. """
+  if development or ci_mode or not _is_legacy_layout():
+    return True
+  script_dir = os.path.dirname(os.path.realpath(__file__))
+  base_dir = script_dir.rsplit('/', 1)[0]
+  ok, detail = _rollback_legacy_install(base_dir)
+  reimage = 'https://github.com/micro-nova/AmpliPi/blob/main/docs/imaging_etcher.md'
+  if ok:
+    msg = (f'This release needs the new A/B partition layout and cannot be installed over the web on this unit. '
+           f'Nothing was changed: your previous version ({detail}) has been restored. '
+           f'To move to this release, reimage the unit: {reimage}')
+  else:
+    msg = (f'This release needs the new A/B partition layout and cannot be installed over the web on this unit, '
+           f'and restoring the previous version automatically failed ({detail}). '
+           f'DO NOT REBOOT. Use the Custom tab in this updater to upload the tar.gz of your previous release '
+           f'from https://github.com/micro-nova/AmpliPi/releases, or reimage the unit: {reimage}')
+  progress([Task('check partition layout', output=msg, success=False)])
+  return False
+
+
 def install(os_deps=True, python_deps=True, custom_deps=True, web=True, restart_updater=False,
             display=True, audiodetector=True, firmware=True, password=True,
             progress=print_task_results, development=False, ci_mode=False, with_alsa=False,
             dep_filter: List[str] = []) -> bool:
   """ Install and configure AmpliPi's dependencies """
   # pylint: disable=too-many-return-statements
+  # First, before anything else: the old 0.4.x web updater runs this on Buster units too.
+  if not _legacy_layout_guard(development, ci_mode, progress):
+    return False
   tasks = [Task('setup')]
 
   def failed():
@@ -1773,9 +1879,14 @@ def install(os_deps=True, python_deps=True, custom_deps=True, web=True, restart_
       if dep != "README.md":
         custom_tasks = _install_custom_deps(dep)
         progress(custom_tasks)
-        tasks += custom_tasks
-        if failed():
-          print(f'Custom dependency {dep} failed to install')
+        # User-provided scripts are best-effort, same as amplipi-postflash.sh treats them: report
+        # a failure but keep it out of `tasks`, or the next failed() check (after the web services)
+        # would abort the install and leave display, audio detector, firmware and backup unset.
+        for task in custom_tasks:
+          if task.success:
+            tasks.append(task)
+          else:
+            print(f'Warning: custom dependency {dep} failed - continuing install')
   # A deploy overwrites .py source files but never touches leftover __pycache__/*.pyc from a
   # previous run - Python only recompiles a stale .pyc when the source's mtime is strictly newer
   # than what's embedded in it, which isn't guaranteed across a tar/cp-based deploy (this has

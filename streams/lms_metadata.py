@@ -53,11 +53,12 @@ class LMSMetadataReader:
   """A class for getting metadata from a Lyrion Music Server."""
 
   # meta_ref is probably an unneccessary variable to pass as an arg since it's obscured from the user, but we can eventually make it an optional setting for the user
-  def __init__(self, name: str, vsrc: int, server: Optional[str] = None, port: Optional[int] = 9000, meta_ref: Optional[int] = 2):
+  def __init__(self, name: str, vsrc: int, server: Optional[str] = None, port: Optional[int] = 9000, meta_ref: Optional[int] = 2,
+               folder: Optional[str] = None):
     self.player_name = name
-    self.folder = os.path.join(
-      '/data', '.config', 'amplipi', 'srcs', f'v{vsrc}'
-    )
+    # The caller (amplipi/streams/lms.py) passes the source's config folder; the fallback only
+    # applies when this script is run by hand on a device.
+    self.folder = folder or os.path.join('/data', '.config', 'amplipi', 'srcs', f'v{vsrc}')
     self.server = server
     self.port = port
     self.meta_ref_rate = meta_ref
@@ -261,10 +262,11 @@ if __name__ == '__main__':
   parser.add_argument('--name', type=str, required=True, help='The name of the LMS Player')
   parser.add_argument('--vsrc', type=str, required=True, help='The numbered source that the player is on')
   parser.add_argument('--server', type=str, default=None, help='The hostname or IP of the computer running the LMS server', metavar="HOSTNAME")
+  parser.add_argument('--folder', type=str, default=None, help="The source's config folder to write metadata into")
   parser.add_argument('--port', type=int, default=9000, help='The port the LMS server uses')
   parser.add_argument('--ref', type=int, default=2, help='The frequency of metadata refresh cycles', metavar="REFRESH_RATE")
   args = parser.parse_args()
 
   # There's a few args here that aren't currently used by the system, but can be helpful for debugging in the field
   # some are also there so we can implement future features easier, or so the devs at home can do the same with a minimal lift
-  LMSMetadataReader(args.name, args.vsrc, args.server, args.port, args.ref).connect()
+  LMSMetadataReader(args.name, args.vsrc, args.server, args.port, args.ref, args.folder).connect()

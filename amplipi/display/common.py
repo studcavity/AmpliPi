@@ -16,6 +16,7 @@ from amplipi.display.statusinterface import set_custom_display_status, STATUS_FI
 
 from amplipi import models
 from amplipi import auth
+from amplipi.paths import USER_CONFIG_DIR
 
 SysInfo = namedtuple('SysInfo', ['hostname', 'password', 'ip', 'status_code', "serial_number", "ext_count"])
 
@@ -75,7 +76,7 @@ class DefaultPass:
      the stored default AmpliPi password."""
 
   # Password config location
-  PASS_DIR = os.path.join('/data', '.config', 'amplipi')
+  PASS_DIR = USER_CONFIG_DIR
   PASS_FILE = os.path.join(PASS_DIR, 'default_password.txt')
   DEFAULT_PI_PASSWORD = 'raspberry'
 

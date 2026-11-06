@@ -7,14 +7,13 @@ from enum import Enum
 from typing import List, Dict, Set, Union, Optional, Callable
 
 from amplipi import models
+from amplipi.paths import USER_CONFIG_DIR  # pylint: disable=unused-import  # re-exported
 
 MUTE_ALL_ID = 10000
 LAST_PRESET_ID = 9999
 AUX_STREAM_ID = 995
 RCAs = [996, 997, 998, 999]
 LMS_DEFAULTS = [1000, 1001, 1002, 1003]
-
-USER_CONFIG_DIR = os.path.join('/data', '.config', 'amplipi')
 
 DEFAULT_CONFIG = {  # This is the system state response that will come back from the amplipi box
   "version": 1,

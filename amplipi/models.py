@@ -30,6 +30,8 @@ import datetime
 # pylint: disable=no-name-in-module
 from pydantic import BaseSettings, BaseModel, Field
 
+from amplipi.paths import USER_CONFIG_DIR
+
 # pylint: disable=too-few-public-methods
 # pylint: disable=missing-class-docstring
 
@@ -1448,7 +1450,7 @@ class AppSettings(BaseSettings):
   """ Controller settings """
   mock_ctrl: bool = True
   mock_streams: bool = True
-  config_file: str = str(Path('/data') / '.config' / 'amplipi' / 'house.json')
+  config_file: str = str(Path(USER_CONFIG_DIR) / 'house.json')
   delay_saves: bool = True
 
 

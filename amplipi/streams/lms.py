@@ -84,7 +84,7 @@ class LMS(PersistentStream):
         # specify the server to connect to (if unspecified squeezelite starts in discovery mode)
         lms_args += ['-s', server]
 
-      meta_args = ['python3', 'streams/lms_metadata.py', "--name", f"{self.name}", "--vsrc", f"{self.vsrc}"]
+      meta_args = ['python3', 'streams/lms_metadata.py', "--name", f"{self.name}", "--vsrc", f"{self.vsrc}", "--folder", src_config_folder]
       if server is not None:
         meta_args.extend(["--server", f"{server}"])
       if self.port is not None:

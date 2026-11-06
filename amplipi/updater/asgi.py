@@ -56,6 +56,7 @@ from packaging.version import parse as parse_version
 from typing import Optional, Callable
 from enum import Enum
 
+from ..paths import DATA_DIR, USER_CONFIG_DIR
 from ..auth import CookieOrParamAPIKey, router as auth_router, set_password_hash, unset_password_hash, \
   NotAuthenticatedException, not_authenticated_exception_handler, create_access_key
 
@@ -171,8 +172,8 @@ def _mounted(partition: int, readonly: bool = False):
   Each operation gets its own directory, so nothing can unmount another operation's target out
   from under it (the old shared /data/tmpmnt allowed exactly that). Read-only mounts use noload so
   even an ext4 journal replay can't write to the partition. """
-  os.makedirs('/data', exist_ok=True)
-  mnt = tempfile.mkdtemp(prefix='slotmnt-', dir='/data')
+  os.makedirs(DATA_DIR, exist_ok=True)
+  mnt = tempfile.mkdtemp(prefix='slotmnt-', dir=DATA_DIR)
   opts = ['-o', 'ro,noload'] if readonly else []
   try:
     subprocess.run(['sudo', 'mount', *opts, f'/dev/mmcblk0p{partition}', mnt], check=True)
@@ -293,7 +294,7 @@ dir_path = os.path.dirname(real_path)
 app.mount("/static", StaticFiles(directory=f"{dir_path}/static"), name="static")
 
 INSTALL_DIR = os.getenv('INSTALL_DIR', os.getcwd())
-USER_CONFIG_DIR = os.path.join('/data', '.config', 'amplipi')
+UPDATE_DIR = os.path.join(DATA_DIR, 'update')
 
 # if we have a broken configuration, the updater should still function
 # as a failsafe. This structure & some code was copied from
@@ -644,7 +645,7 @@ def _update_body(info: UpdateInfo):
     Download manifest.json into /data/update/, then the root.img.xz and boot.img.xz it declares.
     Nothing touches a partition here - /update/flash verifies and flashes them afterwards.
   """
-  dest_dir = "/data/update"
+  dest_dir = UPDATE_DIR
 
   # Set up the SSE event loop with a throttle of 0.5 messages per second (1 message every two seconds)
   progress_state: dict = {}
@@ -787,7 +788,7 @@ def staged_update():
     Reports whether /data/update/manifest.json already exists and, if so, what version and type
     it declares
   """
-  manifest = _load_manifest("/data/update/manifest.json")
+  manifest = _load_manifest(os.path.join(UPDATE_DIR, "manifest.json"))
   if manifest is None:
     return {'staged': False, 'version': None, 'type': None}
   return {'staged': True, 'version': manifest.version, 'type': manifest.type.value}
@@ -901,9 +902,9 @@ def _flash_partition_body(tryboot: bool) -> bool:
     logconf.write(log_buf)
     subprocess.run(['sudo', 'tee', log_path], input=log_buf.getvalue(), text=True, check=True)
 
-  manifest_dir = "/data/update/manifest.json"
-  root_img = "/data/update/root.img.xz"
-  boot_img = "/data/update/boot.img.xz"
+  manifest_dir = os.path.join(UPDATE_DIR, "manifest.json")
+  root_img = os.path.join(UPDATE_DIR, "root.img.xz")
+  boot_img = os.path.join(UPDATE_DIR, "boot.img.xz")
   # BOOT_SLOT is an env_var set by the active boot partition's commandline.txt
   if os.environ.get("BOOT_SLOT") != "A" and os.environ.get("BOOT_SLOT") != "B":
     channel.error("Boot slot could not be read")
@@ -1097,7 +1098,7 @@ def start_flash(tryboot: bool = False):
   # upfront whether this update includes a boot image - e.g. to show the right progress bars
   # immediately, rather than waiting for a boot-labeled message to show up mid-flash (or never,
   # if it's a root-only update).
-  staged_manifest = _load_manifest("/data/update/manifest.json")
+  staged_manifest = _load_manifest(os.path.join(UPDATE_DIR, "manifest.json"))
   has_boot = staged_manifest is not None and staged_manifest.boot is not None
 
   if flash_channel.in_progress.is_set():

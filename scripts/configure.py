@@ -18,6 +18,24 @@ import re
 import sys
 import requests
 import json
+import importlib.util
+
+
+def _load_amplipi_paths():
+  """ Load amplipi/paths.py straight from this checkout, without importing the amplipi package or
+  touching sys.path (this script runs under the system Python, before the venv exists). """
+  path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'amplipi', 'paths.py')
+  spec = importlib.util.spec_from_file_location('_amplipi_paths', path)
+  assert spec is not None and spec.loader is not None
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+# Where the app keeps its config: /data/.config/amplipi on a device, ~/.config/amplipi on a dev box.
+# Device provisioning below (SSH host keys, bluetooth, LMS state, update_scripts, the /data mount
+# recovery) is A/B-image-only and keeps using /data directly.
+USER_CONFIG_DIR = _load_amplipi_paths().USER_CONFIG_DIR
 
 # pylint: disable=broad-except
 # pylint: disable=bare-except
@@ -503,8 +521,8 @@ _os_deps: Dict[str, Dict[str, Any]] = {
             'if ! dpkg-query --show --showformat=\'${Status}\' lyrionmusicserver 2>/dev/null | grep -q "install ok installed"; then',
             *[f'  {line}' for line in _verified_download(*LMS_DEB, '/tmp/lyrionmusicserver_9.1.1.deb')],
             '  sudo dpkg -i /tmp/lyrionmusicserver_9.1.1.deb',
-            '  if [ ! -e /data/.config/amplipi/lms_mode ] ; then sudo systemctl disable lyrionmusicserver; fi',
-            '  if [ ! -e /data/.config/amplipi/lms_mode ] ; then sudo systemctl stop lyrionmusicserver; fi',
+            f'  if [ ! -e {USER_CONFIG_DIR}/lms_mode ] ; then sudo systemctl disable lyrionmusicserver; fi',
+            f'  if [ ! -e {USER_CONFIG_DIR}/lms_mode ] ; then sudo systemctl stop lyrionmusicserver; fi',
             'fi',
             # LMS's prefs (settings, playlists, persist db) and cache (installed 3rd-party plugin
             # code, scan/artwork cache) both live under /var/lib/squeezeboxserver by default -
@@ -700,7 +718,7 @@ def _check_and_setup_platform(development, ci_mode):
       'platform_supported': False,
       'script_dir': script_dir,
       'base_dir': script_dir.rsplit('/', 1)[0],
-      'config_dir': os.path.join('/data', '.config', 'amplipi'),
+      'config_dir': USER_CONFIG_DIR,
       'is_amplipi': False,
       'is_streamer': False,
       'arch': 'unknown',
@@ -726,8 +744,6 @@ def _check_and_setup_platform(development, ci_mode):
       env['arch'] = 'arm64'
 
     env['is_amplipi'] = 'amplipi' in platform.node()  # checks hostname
-    if env['is_amplipi']:
-      env['config_dir'] = '/data/.config/amplipi'
 
     if env['arch'] == 'x64' and env['has_apt']:
       # possibly a development machine running a debian-based distro
@@ -1282,7 +1298,7 @@ def _audiodetector_service(base_dir: str, config_dir: str, user: str = 'pi'):
   return f"""\
 [Unit]
 Description=Amplipi RCA Input Audio Detector
-ConditionPathExists=!/data/.config/amplipi/is_streamer
+ConditionPathExists=!{config_dir}/is_streamer
 
 [Service]
 User={user}
@@ -1486,7 +1502,7 @@ def _configure_authbind() -> List[Task]:
 
 def _api_key() -> Optional[str]:
   """ Get a singular API key for use with the updater """
-  user_file_path = os.path.join('/data', '.config', 'amplipi', 'users.json')
+  user_file_path = os.path.join(USER_CONFIG_DIR, 'users.json')
   if not os.path.exists(user_file_path):
     # Pre-A/B (Buster-era) units keep it in the home dir - needed by _legacy_layout_guard to ask a
     # password-protected legacy unit which version it was running.

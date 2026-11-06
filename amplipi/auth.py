@@ -21,6 +21,9 @@ from hmac import compare_digest
 # pylint: disable=no-name-in-module
 from pydantic import BaseModel
 
+# amplipi.paths is stdlib-only, so this keeps the updater free of heavier AmpliPi dependencies.
+from amplipi.paths import USER_CONFIG_DIR
+
 # The below takes ~200ms to hash on a RPi3 CM and is currently (fall 2023) recommended
 # as a 'safer' default by OWASP. These will only be used when instantiating a new hash;
 # existing hashes encode these parameters within the hash.
@@ -48,10 +51,6 @@ logger.addHandler(sh)
 template_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "templates")
 templates = Jinja2Templates(directory=template_dir)
 
-# This is duplicated from amplipi.config intentionally. This file is pulled in
-# via the updater and we'd like to avoid as many external Amplipi dependencies in the updater
-# as possible.
-USER_CONFIG_DIR = os.path.join('/data', '.config', 'amplipi')
 
 USERS_FILE = os.path.join(USER_CONFIG_DIR, 'users.json')
 

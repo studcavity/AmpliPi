@@ -11,6 +11,8 @@ Type: FULL
   * Switched the loopback playback devices from dmix to plugging directly to hardware, fixing a kernel 6.x incompatibility that could prevent them from opening
   * Fixed a Spotify Connect configuration issue affecting ALSA output
   * Fixed a "Mute All" preset issue in LMS mode
+* Development
+  * The config location is resolved in one place (`amplipi/paths.py`): `/data` on A/B units (never silently falling back), `$AMPLIPI_DATA_DIR` if set, else `~/.config/amplipi` on dev and CI machines without `/data`
 * Updates
   * Rewrote the update system around dual A/B partitions - updates flash to an inactive slot and are health-checked before switching over, so a failed update can no longer leave a unit unbootable. See our [A:B design doc for more details](docs/a_b_design.md)
   * Updates are now always full images (root + boot), verified by checksum before anything is flashed

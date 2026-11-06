@@ -32,7 +32,6 @@ tied together.
   --hostname NAME:    Passed through to build_golden_slot (default: amplipi)
   --img FILE.img:     Passed through to build_golden_slot (use this stock image instead of downloading one)
   --output-dir, -o:   Where to write the captured images + manifest (default: current directory)
-  --no-boot:          Skip imaging the boot partition (passed through to make_images)
   --interactive:      Ask for confirmation before rebuilding the slot, like build_golden_slot
                        --remote does by default on its own. This script's whole point is running
                        unattended, so the default here is the inverse of build_golden_slot's own -
@@ -44,7 +43,6 @@ tied together.
 hostname='amplipi'
 img_file=''
 out_dir='.'
-no_boot=false
 assume_yes=true
 debug=false
 target=''
@@ -54,7 +52,7 @@ while [[ "$#" -gt 0 ]]; do
     --hostname) if (($# > 1)); then hostname=$2; shift; else echo "--hostname requires a value"; exit 1; fi ;;
     --img) if (($# > 1)); then img_file=$2; shift; else echo "--img requires a value"; exit 1; fi ;;
     --output-dir|-o) if (($# > 1)); then out_dir=$2; shift; else echo "--output-dir requires a value"; exit 1; fi ;;
-    --no-boot) no_boot=true ;;
+    --no-boot) echo "--no-boot is no longer supported: full releases must ship boot and root together"; exit 1 ;;
     --interactive) assume_yes=false ;;
     --yes) : ;;  # kept as a harmless no-op - already the default, but accepted so old habits don't break
     --debug) debug=true ;;
@@ -182,9 +180,35 @@ echo "=== 4/5: Switching back to slot $old_slot so slot $new_slot is safely inac
 switch_active_slot "$(boot_part "$old_slot")" "$(boot_part "$new_slot")"
 switched_to_new=false
 
+echo "=== 4b/5: Scrubbing build-unit identity from slot $new_slot before capture ==="
+# This image is published as an OTA release, so anything identifying the build unit would land on
+# every customer unit that installs it. build_golden_slot copied this unit's pi password hash and
+# authorized_keys into the slot and deploy's ssh-copy-id added a key. The updater replaces the pi
+# hash, authorized_keys and machine-id with the receiving unit's own at flash time
+# (carry_over_identity in amplipi/updater/asgi.py); scrubbing here as well means the published
+# image never carries them at all. Same list as capture_disk_image's scrub_slot_identity, plus
+# machine-id: emptied so systemd generates one at boot for factory images, and overwritten with the
+# unit's own id on OTA.
+# shellcheck disable=SC2087  # $(root_part ...) and $new_slot are meant to expand locally
+ssh "$target" "sudo bash -s" <<EOF
+set -euo pipefail
+mnt=\$(mktemp -d)
+mount /dev/mmcblk0p$(root_part "$new_slot") "\$mnt"
+trap 'umount "\$mnt"; rmdir "\$mnt"' EXIT
+sed -i '/^pi:!/!s/^pi:\([^:]*\):/pi:!\1:/' "\$mnt/etc/shadow"
+rm -f "\$mnt/home/pi/.ssh/authorized_keys"
+rm -f "\$mnt/var/lib/support_tunnel/device.db"
+rm -f "\$mnt"/etc/wireguard/*
+rm -rf "\$mnt/var/log/journal"
+: > "\$mnt/etc/machine-id"
+rm -f "\$mnt/var/lib/dbus/machine-id"
+grep -q '^pi:!' "\$mnt/etc/shadow"
+test ! -s "\$mnt/etc/machine-id"
+echo "Scrubbed slot $new_slot root"
+EOF
+
 echo "=== 5/5: Capturing slot $new_slot and generating its manifest ==="
 images_args=(--via "$target" -o "$out_dir")
-$no_boot && images_args+=(--no-boot)
 "$scripts_dir/make_images" "${images_args[@]}" "/dev/mmcblk0p$(root_part "$new_slot")" "/dev/mmcblk0p$(boot_part "$new_slot")"
 "$scripts_dir/make_image_manifest" -d "$out_dir"
 

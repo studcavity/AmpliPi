@@ -132,6 +132,10 @@ scrub_slot_identity() {
   sudo rm -f "$mnt2/var/lib/support_tunnel/device.db"
   sudo rm -f "$mnt2"/etc/wireguard/*
   sudo rm -rf "$mnt2/var/log/journal"
+  # Every unit flashed from this image would otherwise share the build unit's machine-id (DHCP
+  # client id, journald, dbus). Emptied, systemd generates a fresh one on each unit's first boot.
+  sudo truncate -s 0 "$mnt2/etc/machine-id"
+  sudo rm -f "$mnt2/var/lib/dbus/machine-id"
   sudo umount "$mnt2"
   rmdir "$mnt2"
 }

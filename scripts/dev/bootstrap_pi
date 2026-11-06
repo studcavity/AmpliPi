@@ -266,7 +266,7 @@ config_root () {
 
     # Set UTC as timezone
     # Via bash: sudo rm /etc/localtime; echo UTC | sudo tee /etc/timezone >/dev/null | sudo dpkg-reconfigure -f noninteractive tzdata
-    sudo ln -sf usr/share/zoneinfo/Etc/UTC etc/localtime
+    sudo ln -sf /usr/share/zoneinfo/Etc/UTC etc/localtime  # absolute: relative would resolve to /etc/usr/...
     echo UTC | sudo tee etc/timezone >/dev/null
   fi
 

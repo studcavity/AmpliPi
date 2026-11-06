@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an AmpliPi OTA update manifest from root (and optionally boot) images.
+"""Generate an AmpliPi OTA update manifest from root and boot images.
 
 For a full-image release. See make_delta_manifest for the much smaller AmpliPi-code-only
 counterpart - this script is only for a release that ships new root/boot partition images.
@@ -57,7 +57,7 @@ def main():
   parser.add_argument('root', nargs='?',
                        help='Path to root partition image. If omitted, defaults to <dir>/root.img.xz '
                             '(i.e. make_images\' own default output), so the two can be chained with no args.')
-  parser.add_argument('boot', nargs='?', help='Path to boot partition image (optional)')
+  parser.add_argument('boot', nargs='?', help='Path to boot partition image (required; defaults to <dir>/boot.img.xz when root is omitted)')
   parser.add_argument('--dir', '-d', default='.',
                        help='Directory to find default root/boot images in, when root is omitted (default: current directory)')
   parser.add_argument('--output', '-o', help='Output path (default: manifest.json next to root image)')
@@ -80,6 +80,13 @@ def main():
     default_boot = default_image_path('boot.img.xz')
     if os.path.exists(default_boot):
       boot = default_boot
+
+  # The updater refuses a type full manifest without a boot image: shipping a new root (new
+  # /lib/modules) onto a slot whose boot partition keeps its old kernel is a kernel/modules mismatch.
+  if not boot:
+    print('Error: no boot image found - full-image releases must include boot.img.xz alongside root.img.xz '
+          '(the updater rejects root-only full manifests)', file=sys.stderr)
+    sys.exit(1)
 
   for label, path in [('root', root), ('boot', boot)]:
     if path and not os.path.exists(path):

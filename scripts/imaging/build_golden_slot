@@ -262,7 +262,8 @@ sudo sed -i -e "s/^\(blacklist[[:space:]]*i2c[-_]bcm2708\)/#\1/" "$BLACKLIST"
 sudo sed -i -e "s/^#[[:space:]]*\(i2c[-_]dev\)/\1/" "$WORKDIR/target-root/etc/modules"
 grep -q "^i2c[-_]dev" "$WORKDIR/target-root/etc/modules" || printf "i2c-dev\n" | sudo tee -a "$WORKDIR/target-root/etc/modules" >/dev/null
 
-sudo ln -sf usr/share/zoneinfo/Etc/UTC "$WORKDIR/target-root/etc/localtime"
+# Absolute target: a relative "usr/share/..." resolves from /etc, i.e. /etc/usr/share/... (broken)
+sudo ln -sf /usr/share/zoneinfo/Etc/UTC "$WORKDIR/target-root/etc/localtime"
 echo UTC | sudo tee "$WORKDIR/target-root/etc/timezone" >/dev/null
 
 # Using authoritative device paths, not PARTUUID=: the /dev/disk/by-partuuid symlinks are

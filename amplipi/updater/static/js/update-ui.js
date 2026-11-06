@@ -215,7 +215,35 @@ fetch('/update/version').then((resp) => {
   });
 });
 
+// AmpliPi 0.5.0+ needs the A/B partition layout (Raspberry Pi OS Trixie) and can only be
+// installed by reimaging - copying it over this unit in place would leave it unbootable. This
+// updater therefore never offers 0.5.0+ releases, even once one is marked latest on GitHub.
+const REIMAGE_REQUIRED_VERSION = [0, 5, 0];
+const REIMAGE_GUIDE = 'https://github.com/micro-nova/AmpliPi/blob/main/docs/imaging_etcher.md';
+
+function requires_reimage(tag) {
+  let parts = (tag.match(/^v?(\d+)\.(\d+)\.(\d+)/) || []).slice(1).map(Number);
+  if (parts.length !== 3) return false; // unparseable tags (e.g. feature betas) predate 0.5.0
+  for (let i = 0; i < 3; i++) {
+    if (parts[i] !== REIMAGE_REQUIRED_VERSION[i]) return parts[i] > REIMAGE_REQUIRED_VERSION[i];
+  }
+  return true;
+}
+
+function show_reimage_required(release) {
+  $('#latest-update-name').text(release.name + ' requires reimaging');
+  $('#latest-update-desc').append(md.render(
+    'AmpliPi ' + release.tag_name + ' and later run on a new operating system and partition layout, ' +
+    'so they **cannot be installed from this updater**. To move to it, back up your configuration ' +
+    'and reimage the unit by following [this guide](' + REIMAGE_GUIDE + '). ' +
+    'Older 0.4.x releases are still available under **Older**.'));
+}
+
 function show_latest_release(latest_release) {
+  if (requires_reimage(latest_release.tag_name)) {
+    show_reimage_required(latest_release);
+    return;
+  }
   if (latest_release.tag_name == version) {
     console.log('already up to date');
     $('#latest-update-name').empty().append('Your system is up to date  <i class="fas fa-check-circle text-success"></i>')
@@ -233,6 +261,7 @@ function show_latest_release(latest_release) {
 function populate_available_releases(releases) {
   // TODO: indicate difference between pre-releases and full-releases
   for (const release of releases) {
+    if (requires_reimage(release.tag_name)) continue; // see REIMAGE_REQUIRED_VERSION
     console.log(`found "${release.name}" - ${release.tarball_url}`);
     $('#older-update-sel').append(`<option value="${release.tarball_url}"
                                            data-version="${release.tag_name}"

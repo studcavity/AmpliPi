@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate an AmpliPi OTA update manifest from root and boot images.
 
-For a full-image release. See make_delta_manifest for the much smaller AmpliPi-code-only
-counterpart - this script is only for a release that ships new root/boot partition images.
+Every release is a full-image release (delta/code-only releases are not supported), so a
+manifest always names both a root and a boot image.
 
 Doesn't know anything about hosting: root.img.xz/boot.img.xz get uploaded to our fileserver by
 hand, and each image entry's `url` field gets filled in by hand afterward too (see NEW_RELEASE.md)

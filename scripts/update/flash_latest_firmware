@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Programs the preamp(s) with the newest firmware in fw/bin/ (preamp_X.Y.bin), unconditionally -
-# no check against what's currently installed. Safe to run after every update, full or delta:
+# no check against what's currently installed. Safe to run after every update:
 # reflashing identical firmware is harmless, and this is the only thing that ever gets a firmware
 # fix onto an already-shipped unit, since nothing else triggers a flash automatically.
 set -euo pipefail

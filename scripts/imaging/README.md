@@ -41,7 +41,7 @@ bootstrapping from the previous build's own output). Needs a physical USB/rpiboo
 ## Golden release / OTA pipeline
 
 Builds a field release from an already-running, already-partitioned unit, entirely over SSH (no
-USB/rpiboot needed) - either a full-image release or an AmpliPi-code-only delta.
+USB/rpiboot needed). Every release is a full root + boot image; there are no code-only deltas.
 
 - **`make_golden_release`** - end-to-end full-image release: rebuild the inactive slot from a
   clean stock image, deploy AmpliPi onto it, capture it as OTA images, generate its manifest.
@@ -58,8 +58,6 @@ USB/rpiboot needed) - either a full-image release or an AmpliPi-code-only delta.
 - **`make_image_manifest`** - generates the OTA manifest for a full-image release from
   `make_images`' output (checksums, sizes). Doesn't handle hosting - the images and their `url`
   fields still get filled in by hand (see `NEW_RELEASE.md`).
-- **`make_delta_manifest`** - generates the manifest for an AmpliPi-code-only delta release. No
-  image to capture - just a manifest naming a `min_base_version` compatibility floor.
 - **`cleanup`** - cleans up a remote unit's filesystem before it ships to a customer.
 
 ## `modules/`

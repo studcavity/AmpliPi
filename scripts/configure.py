@@ -94,10 +94,8 @@ _os_deps: Dict[str, Dict[str, Any]] = {
                 ],
     },
     'updates': {
-      # rsync is what scripts/update/apply_delta_update actually applies a delta update with. It's been
-      # present on every device so far anyway (part of the base Raspberry Pi OS image), which is
-      # exactly the kind of implicit dependency worth pinning explicitly rather than trusting to
-      # keep being true - see requirements.txt's explicit 'packaging' pin for the same reasoning.
+      # rsync is used by the dev/imaging tooling (e.g. make_image_manifest --target pushes images
+      # with it). Part of the base Raspberry Pi OS image anyway; pinned explicitly so it stays true.
       'apt': ['rsync'],
       'copy': [
         {

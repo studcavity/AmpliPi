@@ -14,7 +14,7 @@ P7 (data): The shared data partition for the slots to persist data with, mounted
 
 # What's changed with updates specifically?
 
-Updates come in two forms: Full and Delta. All update packages contain a manifest.json, telling the updater what type of update they are, what version they are, where to get the related update files, and a few other things depending on the version
+Every update is a full image: a root and a boot partition image, described by a manifest.json that tells the updater what version it is, where to get the images, and their checksums and sizes. (An earlier design also had "delta" updates that rsynced a source tarball onto the inactive slot; they were dropped because they couldn't safely carry apt, systemd or `/etc` changes, and the updater now rejects delta manifests.)
 
 When you update, you update from the active slot to the inactive slot, then restart the system using `sudo reboot '0 tryboot'`, a standard reboot but with an arg that tells the bootloader to use the [tryboot] section of [autoboot.txt](../config/autoboot.txt). When the system reboots, it runs some post-boot, pre-amplipi checks using the [update commit service](../scripts/services/amplipi-tryboot-verify.service) (and [accompanying bash script](../scripts/services/amplipi-tryboot-verify.sh)) that then edits autoboot.txt in p1 to set the new slot to the default (non-tryboot) slot should the update prove successful. Once committed, it also flashes the preamp with whatever firmware is on the slot via [flash_latest_firmware](../scripts/update/flash_latest_firmware). This happens specifically **after** the commit since updating firmware before potentially booting back to the prior slot could brick a unit in the field. If the update isn't successful, it automatically reboots back to the original slot. If those post-boot checks never run due to something being broken, the [amplipi-boot-deadline service](../scripts/services/amplipi-boot-deadline.service) (and [related bash script](../scripts/services/amplipi-boot-deadline.sh)) revert to the good slot after a short timer that begins on system boot and is cancelled by the commit service's checks passing.
 If something somehow is so screwed up that the OS can't even boot, the RPi bootloader should have some controls to correct for that and return to the known good slot as well, but we also sincerely should not ever reach that point if we're doing our due diligence with testing and release creation.
@@ -35,33 +35,13 @@ Full Image `manifest.json`:
 
 A full update is when we image the inactive slot with updated code, ideally saved for when we change the underlying services or linux state of the system. These take about an hour to complete depending on the user's internet speed
 
-A full update always contains a root image, and sometimes contains a boot image. These are downloaded, verified against the related sha256 checksum and bytesize values included in `manifest.json`, and then flashed if everything matches up. After flashing, the system reboots into the freshly updated slot before setting that slot to be the new default (assuming the previously mentioned post-boot checks succeed)
+A full update always contains both a root and a boot image, so a new root's `/lib/modules` always ships with its matching kernel. These are downloaded, verified against the related sha256 checksum and bytesize values included in `manifest.json`, and then flashed if everything matches up. After flashing, the system reboots into the freshly updated slot before setting that slot to be the new default (assuming the previously mentioned post-boot checks succeed)
 
-## Delta Updates
-
-Delta `manifest.json`:
-
-``` json
-{
-  "version": "0.4.12",
-  "type": "delta",
-  "min_base_version": "0.4.11"
-}
-```
-
-A delta update is a simpler update, but slightly more fragile. While a full update doesn't care about what's on the inactive slot due to expecting to blow it all away, the delta update changes the existing files rather than authoritatively setting the partition state. As such, these updates are version gated by a `min_base_version` value that contains the version number of the most recent previous full image update. If the inactive slot's version is under that value, the updater will first download and flash that update to the inactive slot before handling the delta update.
-
-The name "delta update" is a slight misnomer, as there's no file delta calculations involved - this is just an industry standard name for this update type (as seen by [Android having the same verbiage](https://source.android.com/docs/core/ota/ab/ab_implement)). What it actually does is download the github source tarball, much like our current update structure does, but instead of running the `configure.py` script and set all sorts of system state, we just use `rsync` to make sure the file contents are the same as the installed tarball before rebooting into the updated slot.
-
-The rsync only touches a fixed set of paths - the app code, scripts, streams, config, firmware, dependencies, and the frontend - not packages, services, or OS config, which still need a full image.
 
 ## How are updates made?
 
 See our [new release doc](../NEW_RELEASE.md) for a higher quality explanation, but here's a quick rundown:
 
-### Delta Releases
-
-Delta releases are similar to our previous update scheme, but instead of simply installing a tarball and self-applying with the configure script we first install a manifest.json for validation's sake, then download the tarball and rsync it to the inactive slot. If the inactive slot's version is under the `min_base_version` floor, a flash to that version happens automatically before the delta is applied. the `manifest.json` is made by running `./scripts/imaging/make_delta_manifest {RELEASE_VERSION} {MIN_BASE_VERSION}`.
 
 ### Full Image Releases
 

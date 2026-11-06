@@ -28,8 +28,6 @@ function ui_check_after_reboot(retry_check_ct) {
     response.json().then(function(json) {
       ui_add_log(json.version, 'info');
       ui_add_log('Done restarting updater', 'info');
-      // No longer forcibly sends user back to amplipi home screen due to multi step
-      // (full -> delta) updates seeming like a device issue when the second half completed
       ui_show_done();
     }).catch( err => {
       if (retry_check_ct > 0) {
@@ -62,19 +60,10 @@ const FLASH_PHASES_ROOT_ONLY = ['Verifying root image', 'Flashing root'];
 // bar sits still for however long the download takes before flashing even starts.
 const DOWNLOAD_THEN_FLASH_PHASES_WITH_BOOT = ['Downloading root image', 'Downloading boot image'].concat(FLASH_PHASES_WITH_BOOT);
 const DOWNLOAD_THEN_FLASH_PHASES_ROOT_ONLY = ['Downloading root image'].concat(FLASH_PHASES_ROOT_ONLY);
-// The three percentage-bearing steps of a delta update (no images involved at all). Weighted,
-// not equal thirds - the manifest is a few hundred bytes and takes no perceptible time next to
-// the other two, so an equal share would make the bar sit idle through most of that segment.
-const DELTA_PHASES = [
-  {label: 'Downloading manifest', weight: 1},
-  {label: 'Downloading release', weight: 4},
-  {label: 'Applying update', weight: 3},
-  {label: 'Installing Python dependencies', weight: 1},
-];
 let flashPhases = FLASH_PHASES_ROOT_ONLY;
 let boldLabelEl = null;
 
-// Accepts a plain label string (equal weight) or {label, weight} (e.g. DELTA_PHASES) - assigns
+// Accepts a plain label string (equal weight) or {label, weight} - assigns
 // each phase its [start, start+segment) range along the bar, cached so per-message lookups are cheap.
 function normalize_phases(phases) {
   let withWeights = phases.map((p) => typeof p === 'string' ? {label: p, weight: 1} : p);
@@ -99,7 +88,7 @@ function ui_update_progress_bar(message) {
   let bar = $('#update-progress-bar');
   bar.css('width', overall + '%').attr('aria-valuenow', overall).text(Math.round(overall) + '%');
   bar.toggleClass('bg-info', label.indexOf('Verifying') === 0 || label.indexOf('Downloading') === 0);
-  bar.toggleClass('bg-primary', label.indexOf('Flashing') === 0 || label.indexOf('Applying') === 0);
+  bar.toggleClass('bg-primary', label.indexOf('Flashing') === 0);
   if (boldLabelEl === null || boldLabelEl.data('bound-label') !== label) {
     if (boldLabelEl) boldLabelEl.removeClass('font-weight-bold');
     boldLabelEl = $('.update-progress-label[data-label="' + label + '"]').addClass('font-weight-bold');
@@ -107,7 +96,7 @@ function ui_update_progress_bar(message) {
   }
 }
 
-// Sets up the progress bar for the given phases (2-5, see FLASH_PHASES_*/DELTA_PHASES above).
+// Sets up the progress bar for the given phases (see FLASH_PHASES_* above).
 function ui_configure_progress_phases(phases) {
   flashPhases = normalize_phases(phases);
   boldLabelEl = null;
@@ -131,23 +120,8 @@ function ui_reset_progress_bars() {
   ui_configure_progress_phases(FLASH_PHASES_ROOT_ONLY);
 }
 
-// A delta whose target slot doesn't meet min_base_version gets a base image flashed first, then
-// the delta - two stages, reusing the same bar (reset between them, not reconfigured mid-fill,
-// which would visibly shrink an already-filled segment). Most deltas never hit this.
-//
-// Detected by matching substrings of do_minimal_update's log lines - if those phrases change,
-// this silently stops detecting the transition.
-function ui_check_delta_phase_transition(message) {
-  if (message.includes('flashing that version as a base first')) {
-    ui_configure_progress_phases(DOWNLOAD_THEN_FLASH_PHASES_WITH_BOOT);
-  } else if (message.includes('continuing with delta to')) {
-    ui_configure_progress_phases(DELTA_PHASES);
-  }
-}
-
 function ui_show_update_progress(status) {
   // assumes status {'message': str, 'type': 'info'|'warning'|'error'|'success'|'failed'}
-  ui_check_delta_phase_transition(status.message);
   ui_update_progress_bar(status.message);
   let color = (status.type == 'error' || status.type == 'failed') ? 'danger' : status.type;
   if (status.message.trim().length > 0) {
@@ -191,7 +165,7 @@ function ui_select_release(sel) {
 }
 
 // Watches an SSE progress channel until a terminal event - onSuccess() on 'success',
-// ui_show_failure() on 'error'. Shared by ui_begin_flash_watch() and ui_download_then_finish().
+// ui_show_failure() on 'error'. Shared by ui_begin_flash_watch() and ui_download_then_flash().
 function ui_watch_sse(url, onSuccess) {
   var source = new EventSource(url);
   source.onmessage = function(event) {
@@ -236,37 +210,23 @@ function ui_begin_flash_watch(reconfigureBoot) {
   });
 }
 
-// Shared by all download-then-finish flows. manifestUrl is the only download location needed -
+// Shared by all download-then-flash flows. manifestUrl is the only download location needed -
 // image urls live inside the manifest itself, read directly by the backend. expectedVersion
-// (optional) rejects a manifest that doesn't match. type must already be known by the caller
-// (every caller already fetched it once to label its own button) - looking it up again after
-// calling would race do_minimal_update's own reboot. Callers set up their own button/log/progress
-// state first, same as ui_begin_flash_watch().
-//
-// Named "finish", not "flash": a full manifest still needs a follow-up /update/flash call, but a
-// delta manifest is already fully applied (including its own reboot) by the time this reports
-// success - calling /update/flash after a delta would be wrong.
-function ui_download_then_finish(manifestUrl, expectedVersion, type) {
+// (optional) rejects a manifest that doesn't match. Callers set up their own button/log/progress
+// state first, same as ui_begin_flash_watch(). Every update is a full image: download, then flash.
+function ui_download_then_flash(manifestUrl, expectedVersion) {
   fetch('/update/download/images', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       manifest_url: manifestUrl,
       expected_version: expectedVersion || null,
-      tryboot: true,
     }),
   }).then((response) => response.json()).then((data) => {
     // Watch regardless of whether this started a fresh download or one was already running.
     ui_watch_sse('update/download/images/progress', function() {
-      if (type === 'delta') {
-        // do_minimal_update already applied the change and triggered tryboot - nothing left to
-        // call, just wait for the reboot the same way the full-image path does after /update/flash.
-        ui_add_log('Delta update applied, waiting for the unit to reboot into the new slot', 'info');
-        setTimeout(ui_check_after_reboot, 5000, 2 * 60 / 5 - 1);
-      } else {
-        ui_add_log('Download complete, starting flash', 'info');
-        ui_begin_flash_watch(false);
-      }
+      ui_add_log('Download complete, starting flash', 'info');
+      ui_begin_flash_watch(false);
     });
   }).catch((e) => {
     ui_add_log('Failed to start download: ' + e, 'danger');
@@ -289,21 +249,14 @@ function ui_start_release_download(release, skipIfStaged) {
       return;
     }
     let info = releaseManifestInfo[release.tag_name];
-    if (info && info.type === 'delta') {
-      ui_configure_progress_phases(DELTA_PHASES);
-    } else {
-      ui_configure_progress_phases(info && info.hasBoot ? DOWNLOAD_THEN_FLASH_PHASES_WITH_BOOT : DOWNLOAD_THEN_FLASH_PHASES_ROOT_ONLY);
-    }
+    ui_configure_progress_phases(info && info.hasBoot ? DOWNLOAD_THEN_FLASH_PHASES_WITH_BOOT : DOWNLOAD_THEN_FLASH_PHASES_ROOT_ONLY);
     ui_add_log('Downloading ' + release.tag_name, 'info');
-    ui_download_then_finish(manifest_url, release.tag_name, info ? info.type : null);
+    ui_download_then_flash(manifest_url, release.tag_name);
   }
 
   if (skipIfStaged) {
     fetch('/update/staged').then((r) => r.json()).then((staged) => {
-      // type check matters: this shortcut skips a redundant multi-GB re-download, which only
-      // applies to type full - a staged delta has no images to skip re-downloading, so treating
-      // it the same way would send the flow to /update/flash looking for a root.img.xz that was
-      // never there.
+      // Skip a redundant multi-GB re-download if this exact release is already staged.
       if (staged.staged && staged.type === 'full' && staged.version === release.tag_name) {
         ui_add_log('Already downloaded, flashing directly', 'info');
         ui_reset_progress_bars();
@@ -342,19 +295,10 @@ function ui_show_offline_message() {
 
 // get the current AmpliPi version
 let version = 'unknown';
-// undefined = not yet loaded (stay pending); null/'' = a real but unreadable inactive slot,
-// treated as definitely below any delta's min_base_version floor. See compute_label_type.
-let inactiveVersion;
 fetch('/update/version').then((resp) => {
   resp.json().then((info) => {
     version = info.version;
-    inactiveVersion = info.inactive_version;
     MIN_SECURE_VERSION = info.min_secure_version;
-    // A release's label may have already been computed (and skipped, since inactiveVersion was
-    // still undefined) before this resolved - redo it now for whatever's currently on screen.
-    if (latestRelease) apply_update_label('#submit-latest-update', releaseManifestInfo[latestRelease.tag_name]);
-    let selectedTag = $('#older-update-sel').val();
-    if (availableReleases[selectedTag]) apply_update_label('#submit-older-update', releaseManifestInfo[selectedTag]);
   });
 });
 
@@ -396,7 +340,7 @@ const MIN_SUPPORTED_VERSION = '0.5.0'; // Used to prevent users from attempting 
 let MIN_SECURE_VERSION = null; // Null until info fetch, gates what versions show in the other releases dropdown
 
 // Simple major.minor.patch comparison, not full semver - fine here since this is only a UI-side
-// preview (real enforcement is asgi.py's do_minimal_update, with real semver parsing). Returns
+// preview (the backend enforces the real version checks with proper parsing). Returns
 // true if `v` >= `floor`.
 function version_at_least(v, floor) {
   let vp = v.split('.').map(Number);
@@ -410,7 +354,7 @@ function version_at_least(v, floor) {
 
 // Same idea as latestRelease, but keyed by tag_name since Other Releases can point at any of several.
 let availableReleases = {};
-// tag_name -> {type, min_base_version, hasBoot}, populated as each release's manifest resolves
+// tag_name -> {type, hasBoot}, populated as each release's manifest resolves
 // in the background. Read here instead of re-fetching on every dropdown/button interaction - by
 // the time a release is clickable, its manifest fetch has near-certainly already finished.
 let releaseManifestInfo = {};
@@ -432,9 +376,6 @@ function populate_available_releases(releases) {
 
     let manifest_url = find_manifest_url(release);
     if (manifest_url) {
-      // No min_base_version-vs-inactive-slot check here: do_minimal_update's floor-check fallback
-      // (asgi.py) handles that automatically server-side, flashing min_base_version as a base
-      // image before applying the delta. Every post-cutoff release stays selectable here.
       fetch_manifest(manifest_url).then((manifest) => {
         // Stored even on failure (null): distinguishes "fetch failed" from "not fetched yet" for
         // apply_update_label/compute_label_type, which key their pending-vs-fail-open state off that.
@@ -459,7 +400,7 @@ function find_manifest_url(release) {
 // Label shown on an update button once its manifest's type is known. Falls back to the type full
 // label if the manifest can't be fetched/parsed at all (offline, CORS, ...) - the label is a
 // convenience, not load-bearing, so failing open here just means it doesn't update.
-const UPDATE_TYPE_LABELS = {full: 'Begin Flash', delta: 'Update now'};
+const UPDATE_TYPE_LABELS = {full: 'Begin Flash'};
 // Shown (button greyed out via the 'disabled' class) while a button's real label is still unknown.
 const CHECKING_LABEL = 'Checking update...';
 // Sentinel stored in releaseManifestInfo/passed to apply_update_label when a release has no
@@ -468,28 +409,22 @@ const CHECKING_LABEL = 'Checking update...';
 const MANIFEST_UNAVAILABLE = 'unavailable';
 const MANIFEST_UNAVAILABLE_LABEL = 'Update package unavailable';
 
-// Resolves manifestUrl to {type, min_base_version, hasBoot}, or null on failure. type defaults
-// to 'full' if omitted. hasBoot decides which progress-bar phases to show before download starts.
+// Resolves manifestUrl to {type, hasBoot}, or null on failure. type defaults to 'full' if
+// omitted. hasBoot decides which progress-bar phases to show before download starts.
 function fetch_manifest(manifestUrl) {
   return fetch(manifestUrl).then((r) => r.json())
-    .then((m) => ({type: m.type || 'full', min_base_version: m.min_base_version || null, hasBoot: m.boot != null}))
+    .then((m) => ({type: m.type || 'full', hasBoot: m.boot != null}))
     .catch(() => null);
 }
 
-// A DELTA manifest alone doesn't say whether clicking it triggers a flash - do_minimal_update
-// flashes a base image first if the inactive slot doesn't meet min_base_version. version_at_least
-// isn't hardened for dirty version strings on purpose: a non-numeric segment parses to NaN, and
-// NaN comparisons are always false, so an unparseable version already fails the floor check safely.
+// Delta updates are no longer supported (every update is a full image), so a release whose
+// manifest declares any other type is shown as unavailable rather than offered.
 function compute_label_type(manifest) {
   if (manifest === MANIFEST_UNAVAILABLE) return MANIFEST_UNAVAILABLE; // no manifest.json asset exists
   if (manifest === undefined) return null; // not fetched yet - stay pending
   if (manifest === null) return 'full'; // fetch failed - fail open to the safe default
-  if (manifest.type !== 'delta') return manifest.type; // 'full' as today
-  if (inactiveVersion === undefined) return null; // /update/version hasn't resolved yet - don't guess
-  if (!inactiveVersion || !version_at_least(inactiveVersion, manifest.min_base_version)) {
-    return 'full'; // will flash a base image first - same label, same mechanics as a real full release
-  }
-  return 'delta';
+  if (manifest.type !== 'full') return MANIFEST_UNAVAILABLE;
+  return 'full';
 }
 
 // Greys the button out with a neutral label until compute_label_type has a real answer, rather

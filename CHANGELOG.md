@@ -13,7 +13,7 @@ Type: FULL
   * Fixed a "Mute All" preset issue in LMS mode
 * Updates
   * Rewrote the update system around dual A/B partitions - updates flash to an inactive slot and are health-checked before switching over, so a failed update can no longer leave a unit unbootable. See our [A:B design doc for more details](docs/a_b_design.md)
-  * Added a new "full image" update type, and strengthened the old update type (which is now called a "delta update")
+  * Updates are now always full images (root + boot), verified by checksum before anything is flashed
   * Added two forms of update floor: One that prevents downgrading to non-A:B partitioned versions, and another to target against versions with security flaws. We do not currently have any security flawed versions, but we have a solution prepared should it come up.
   * Settings, configuration, and logs now persist across updates and slot swaps
   * Reorganized and rebuilt the image-provisioning/release-build tooling around the new A/B pipeline (`scripts/imaging`, `scripts/update`, `scripts/dev`, `scripts/services`, `scripts/jobs`)
@@ -21,7 +21,6 @@ Type: FULL
   * Added support for user-provided post-update scripts and package lists (`/data/update_scripts/*.sh`, `/data/packages.apt`). Both are re-applied automatically after every update, so custom device configuration and manually-installed packages survive a full image reflash.
 * Web App
   * Add progress bar(s) to the update flow
-  * Update button now shows what type of update it is: full image (large update) or delta (small and fast update)
   * Removed auto-redirect back to app on update completion
 
 # 0.4.12

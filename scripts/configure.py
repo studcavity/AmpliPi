@@ -79,6 +79,58 @@ $IncludeConfig /etc/rsyslog.d/*.conf
 
 """
 
+# Upstream sources built on-device, pinned to exact commits so golden images are reproducible
+# (they used to build whatever master/HEAD was at the time). Each pin is the commit that was the
+# default branch's HEAD on 2026-10-01, i.e. what this release was actually built and tested with.
+# To bump one, change its commit here: the stamp file check in _pinned_build_guard makes existing
+# units rebuild it on their next deploy instead of skipping it as "already installed".
+PINNED_SOURCES = {
+    'nqptp': ('https://github.com/mikebrady/nqptp.git', '66a924b42f2ec2efacd03d040e669a20ab1c0e4e'),  # after 1.2.9-dev
+    'redsea': ('https://github.com/windytan/redsea.git', '7555c9f6259d50718697ee8c9f218ea012c6892c'),  # v1.3.1+
+    'gmrender-resurrect': ('https://github.com/hzeller/gmrender-resurrect.git', '3d87b3678bef4d0886cc526fe75d5e1285704310'),  # v0.3.1+
+    'bluez-alsa': ('https://github.com/arkq/bluez-alsa.git', '1a84465dd860d1be9dcf62339c6273e9e0632dd2'),  # v5.0.0+
+    'support_tunnel': ('https://github.com/micro-nova/support_tunnel.git', '56a1b85fd647b0b2eae5a18fbc5486ed93f408f9'),
+}
+PIN_STAMP_DIR = '/usr/local/share/amplipi/pins'
+# Single files fetched from upstream: (url at a pinned commit, sha256)
+RTL_SDR_RULES = ('https://raw.githubusercontent.com/osmocom/rtl-sdr/797f8143266d983c56d8f35d2d442527529dd8a5/rtl-sdr.rules',
+                 '68f072ba67a6c59ad311a951c850a915170beb8103e3fa5235259a4c9f7c1b15')
+# Lyrion publishes no checksums; this one was taken from the 9.1.1 download on 2026-11-06.
+LMS_DEB = ('https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_all.deb',
+           '4325fbd3a57642730e01fb24849aae00d57e4471019a8989061ec43571064299')
+
+
+def _pinned_checkout(name: str, dest: str) -> List[str]:
+  """ Shell lines that put exactly PINNED_SOURCES[name]'s commit into dest (a fresh directory) """
+  url, sha = PINNED_SOURCES[name]
+  return [
+      f'rm -rf {dest}',
+      f'git init -q {dest}',
+      f'git -C {dest} fetch -q --depth 1 {url} {sha}',
+      f'git -C {dest} checkout -q FETCH_HEAD',
+  ]
+
+
+def _pinned_build_guard(name: str) -> str:
+  """ Shell condition: true when the pinned commit of `name` is already built and installed """
+  return f'[ "$(cat {PIN_STAMP_DIR}/{name} 2>/dev/null)" = "{PINNED_SOURCES[name][1]}" ]'
+
+
+def _pinned_build_stamp(name: str) -> str:
+  """ Shell line recording that the pinned commit of `name` was built and installed """
+  return f'sudo mkdir -p {PIN_STAMP_DIR} && echo {PINNED_SOURCES[name][1]} | sudo tee {PIN_STAMP_DIR}/{name} >/dev/null'
+
+
+def _verified_download(url: str, sha256: str, dest: str, sudo: bool = False) -> List[str]:
+  """ Shell lines that download url to dest and fail unless it matches sha256 """
+  s = 'sudo ' if sudo else ''
+  return [
+      f'{s}wget -nv {url} -O {dest}.part',
+      f'echo "{sha256}  {dest}.part" | sha256sum -c --quiet || {{ {s}rm -f {dest}.part; echo "checksum mismatch for {url}"; exit 1; }}',
+      f'{s}mv {dest}.part {dest}',
+  ]
+
+
 _os_deps: Dict[str, Dict[str, Any]] = {
     'base': {
         'apt': ['curl', 'authbind',
@@ -374,14 +426,14 @@ _os_deps: Dict[str, Dict[str, Any]] = {
             'sudo adduser pi support',
             'sudo mkdir -p /var/lib/support_tunnel',
             'sudo chmod 0777 /var/lib/support_tunnel',  # TODO: lock this down
-            'if [ ! -e /opt/support_tunnel ] ; then'
-            '  pushd $(mktemp --directory)',
-            '  git clone https://github.com/micro-nova/support_tunnel.git',
-            '  sudo mv support_tunnel /opt',
-            '  popd',
+            # Pinned (was `git reset --hard origin/main` on every deploy). A pin bump re-fetches.
+            f'if ! {_pinned_build_guard("support_tunnel")} || [ ! -e /opt/support_tunnel ]; then',
+            '  sudo rm -rf /opt/support_tunnel',
+            *[f'  {line}' for line in _pinned_checkout('support_tunnel', '/tmp/support_tunnel')],
+            '  sudo mv /tmp/support_tunnel /opt/support_tunnel',
+            f'  {_pinned_build_stamp("support_tunnel")}',
             'fi',
             'pushd /opt/support_tunnel',
-            'git fetch && git reset --hard origin/main',
             'if [ ! -e /opt/support_tunnel/venv ]; then',
             '  /usr/bin/python3 -m venv venv',
             'fi',
@@ -399,15 +451,16 @@ _os_deps: Dict[str, Dict[str, Any]] = {
         'script': [
             'sudo loginctl enable-linger pi',
             'set -e',
-            'if which nqptp  > /dev/null; then exit 0; fi',
+            f'if which nqptp > /dev/null && {_pinned_build_guard("nqptp")}; then exit 0; fi',
             'pushd $(mktemp --directory)',
-            'git clone https://github.com/mikebrady/nqptp.git',
+            *_pinned_checkout('nqptp', 'nqptp'),
             'pushd nqptp',
             'autoreconf -fi',
             './configure --with-systemd-startup',
             'make',
             'sudo make install',
             'sudo systemctl enable nqptp && sudo systemctl restart nqptp',
+            _pinned_build_stamp('nqptp'),
             'popd',
             'popd',
         ]
@@ -419,17 +472,17 @@ _os_deps: Dict[str, Dict[str, Any]] = {
         'apt': ['rtl-sdr', 'git', 'build-essential', 'libsndfile1-dev', 'libliquid-dev', 'meson'],
         'script': [
             'set -e',
-            'if ! which redsea  > /dev/null; then',  # TODO: check version
+            f'if ! which redsea > /dev/null || ! {_pinned_build_guard("redsea")}; then',
             '  echo "Installing redsea"',
             '  cd /tmp',
-            '  rm -rf redsea',
-            '  git clone --depth 1 https://github.com/windytan/redsea.git',
+            *[f'  {line}' for line in _pinned_checkout('redsea', 'redsea')],
             '  cd redsea',
             '  meson setup build',
             '  cd build',
             '  meson compile',
             '  sudo cp redsea /usr/local/bin/',
-            '  sudo wget https://raw.githubusercontent.com/osmocom/rtl-sdr/master/rtl-sdr.rules -P /etc/udev/rules.d/',
+            f'  {_pinned_build_stamp("redsea")}',
+            *[f'  {line}' for line in _verified_download(*RTL_SDR_RULES, '/etc/udev/rules.d/rtl-sdr.rules', sudo=True)],
             '  sudo udevadm control --reload-rules',
             '  sudo udevadm trigger',
             'fi',
@@ -447,8 +500,8 @@ _os_deps: Dict[str, Dict[str, Any]] = {
             # arm64-suffixed URL here never resolved to anything real.
             # `[ ! $(... | grep -q ...) ]` was always true (grep -q prints nothing, so the test saw an
             # empty string) - LMS got re-downloaded and reinstalled on every run. Test grep's status.
-            'if ! dpkg-query --show --showformat=\'${Status}\' lyrionmusicserver 2>/dev/null | grep -q "install ok installed"; then '
-            '  wget -nv https://downloads.lms-community.org/LyrionMusicServer_v9.1.1/lyrionmusicserver_9.1.1_all.deb -O /tmp/lyrionmusicserver_9.1.1.deb',
+            'if ! dpkg-query --show --showformat=\'${Status}\' lyrionmusicserver 2>/dev/null | grep -q "install ok installed"; then',
+            *[f'  {line}' for line in _verified_download(*LMS_DEB, '/tmp/lyrionmusicserver_9.1.1.deb')],
             '  sudo dpkg -i /tmp/lyrionmusicserver_9.1.1.deb',
             '  if [ ! -e /data/.config/amplipi/lms_mode ] ; then sudo systemctl disable lyrionmusicserver; fi',
             '  if [ ! -e /data/.config/amplipi/lms_mode ] ; then sudo systemctl stop lyrionmusicserver; fi',
@@ -496,18 +549,16 @@ _os_deps: Dict[str, Dict[str, Any]] = {
         'script': [
             # Skip the build once gmediarender is already installed, to avoid rebuilding from
             # source on every deploy.
-            'if [ ! -e /usr/local/bin/gmediarender ]; then',
-            'if [ ! -d "gmrender-resurrect" ] ; then',
-            '  git clone https://github.com/hzeller/gmrender-resurrect.git gmrender-resurrect',
-            '  cd gmrender-resurrect',
-            'else',
-            '  cd gmrender-resurrect',
-            '  git pull https://github.com/hzeller/gmrender-resurrect.git',
-            'fi',
+            f'if [ ! -e /usr/local/bin/gmediarender ] || ! {_pinned_build_guard("gmrender-resurrect")}; then',
+            'pushd $(mktemp --directory)',
+            *_pinned_checkout('gmrender-resurrect', 'gmrender-resurrect'),
+            'cd gmrender-resurrect',
             './autogen.sh',
             './configure',
             'make',
             'sudo make install',
+            _pinned_build_stamp('gmrender-resurrect'),
+            'popd',
             'else',
             'echo gmediarender already installed, skipping build.',
             'fi',
@@ -538,15 +589,15 @@ _os_deps: Dict[str, Dict[str, Any]] = {
 
             # Skip the bluealsa build once already installed, to avoid a full re-clone/rebuild on
             # every deploy.
-            'if [ ! -e /usr/bin/bluealsad ]; then',
+            f'if [ ! -e /usr/bin/bluealsad ] || ! {_pinned_build_guard("bluez-alsa")}; then',
             'echo installing bluealsa from source',
-            'rm -rf bluez-alsa',
-            'git clone https://github.com/arkq/bluez-alsa',
+            *_pinned_checkout('bluez-alsa', 'bluez-alsa'),
             'cd bluez-alsa',
             'autoreconf --install --force',
             './configure --disable-aac --disable-ldac --disable-aptx --disable-opus',
             'sudo make -j$(nproc)',
             'sudo make install',
+            _pinned_build_stamp('bluez-alsa'),
             'cd ..',
             'else',
             'echo bluealsa already installed, skipping build.',

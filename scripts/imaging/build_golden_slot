@@ -187,11 +187,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The stock base image every golden slot is built from, pinned by date and checksum so golden
+# builds are reproducible. sha256 is Raspberry Pi's own, from $release.xz.sha256 next to the image.
+release=2025-12-04-raspios-trixie-arm64-lite.img
+release_xz_sha256=681a775e20b53a9e4c7341d748a5a8cdc822039d8c67c1fd6ca35927abbe6290
+
 if [[ -n "$IMG_PATH" ]]; then
   echo "Using pre-copied image at $IMG_PATH"
+  echo "  (not checksum-verified - this is only $release if you copied that exact image;"
+  echo "   its .xz should have sha256 $release_xz_sha256)"
   img_file="$IMG_PATH"
 else
-  release=2025-12-04-raspios-trixie-arm64-lite.img
   url=https://downloads.raspberrypi.org/raspios_lite_arm64/images/raspios_lite_arm64-2025-12-04/$release.xz
   echo "Downloading stock image directly on-device..."
   # -q was hiding wget's own error output on failure, making that failure look like a silent
@@ -199,6 +205,10 @@ else
   # doesn't work rather than relying on set -e's bare non-zero exit alone.
   if ! wget "$url" -O "$WORKDIR/$release.xz"; then
     echo "Error: failed to download stock image from $url"
+    exit 1
+  fi
+  if ! echo "$release_xz_sha256  $WORKDIR/$release.xz" | sha256sum -c --quiet; then
+    echo "Error: $release.xz does not match its pinned sha256 - refusing to build from it"
     exit 1
   fi
   unxz "$WORKDIR/$release.xz"  # deletes the .xz on success by default, no separate cleanup needed

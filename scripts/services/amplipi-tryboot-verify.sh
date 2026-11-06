@@ -23,7 +23,14 @@ retry() {
   return 1
 }
 
-current_part=$( [[ "${BOOT_SLOT}" == "A" ]] && echo 2 || echo 3 )
+# BOOT_SLOT is injected via systemd.setenv on the kernel cmdline. If it's missing we can't tell
+# which slot we're on, so treat it as a failed trial boot rather than dying under `set -u` and
+# leaving the unit to sit until the 15-minute deadline fires.
+if [ -z "${BOOT_SLOT:-}" ]; then
+  current_part=""
+else
+  current_part=$( [[ "${BOOT_SLOT}" == "A" ]] && echo 2 || echo 3 )
+fi
 
 commit() { # Swap which boot slot is considered primary and secondary p1's autoboot.txt
   local old_part
@@ -56,9 +63,13 @@ commit() { # Swap which boot slot is considered primary and secondary p1's autob
   # only ever touches the preamp once the OS-level update is already confirmed good and
   # permanent - never against content that might still get reverted. Failure here doesn't undo
   # the commit above; a bad flash and an already-good OS update are independent concerns.
+  # amplipi.service drives the same I2C bus and serial line the flasher uses - stop it for the
+  # duration, and always bring it back afterward whether or not the flash worked.
   log "Checking preamp firmware"
+  systemctl stop amplipi || log "Warning: couldn't stop amplipi before firmware check"
   bash /home/pi/amplipi-dev/scripts/update/flash_latest_firmware 2>&1 | while read -r line; do log "$line"; done \
     || log "Warning: firmware flash failed - will retry on the next update"
+  systemctl start amplipi || log "Warning: couldn't restart amplipi after firmware check"
 
   log "Commit complete. Default: p${current_part} | Tryboot: p${old_part}"
 }
@@ -82,6 +93,11 @@ fi
 expected_part=$(tr -d '[:space:]' < "${PENDING_FILE}")
 log "Trial boot detected. Expected p${expected_part}, running on p${current_part}"
 
+if [ -z "${current_part}" ]; then
+  revert "BOOT_SLOT not set on the kernel cmdline - cannot identify the running slot"
+  exit 0
+fi
+
 if [ "${current_part}" != "${expected_part}" ]; then
   revert "Booted on wrong partition (expected p${expected_part}, got p${current_part})"
   exit 0
@@ -101,7 +117,28 @@ failed_checks=()
 retry 12 5 timeout 10 systemctl is-active amplipi       || failed_checks+=("amplipi service")
 retry 12 5 timeout 10 systemctl is-active amplipi-tasks || failed_checks+=("amplipi-tasks service")
 retry 6  5 timeout 10 systemctl is-active redis-server                || failed_checks+=("redis-server service")
-retry 12 5 curl -sf --max-time 5 http://localhost/api      || failed_checks+=("API health check")
+# /api sits behind CookieOrParamAPIKey, so on a password-protected unit an unauthenticated request
+# 401s and the check would fail on every update. We run as root, so read any stored access key
+# straight out of the users file and pass it as the api-key query param. With no keys set (no
+# password), auth is open and the bare URL works.
+api_url="http://localhost/api"
+api_key=$(python3 - <<'PYEOF' 2>/dev/null || true
+import json
+try:
+  with open('/data/.config/amplipi/users.json', encoding='utf-8') as f:
+    users = json.load(f)
+  for u in users.values():
+    if isinstance(u, dict) and u.get('access_key'):
+      print(u['access_key'])
+      break
+except Exception:
+  pass
+PYEOF
+)
+if [ -n "${api_key}" ]; then
+  api_url="${api_url}?api-key=${api_key}"
+fi
+retry 12 5 curl -sf --max-time 5 "${api_url}"      || failed_checks+=("API health check")
 
 if [ "${#failed_checks[@]}" -gt 0 ]; then
   revert "Failed: ${failed_checks[*]}"

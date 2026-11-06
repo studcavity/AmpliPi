@@ -38,6 +38,8 @@ import lzma
 import io
 
 import configparser
+import contextlib
+import tempfile
 
 # web framework
 import requests
@@ -89,6 +91,8 @@ class SSEChannel:
     self.idle_message = idle_message
     """Message shown when there is nothing in progress"""
 
+    self._start_lock = threading.Lock()
+
   def _message(self, t: str, msg: str):
     msg = msg.replace('\n', '<br>')
     sse_msg = {'data': json.dumps({'message': msg, 'type': t})}
@@ -105,9 +109,12 @@ class SSEChannel:
     self._message('success', msg)
 
   def start(self, target: Callable, args: tuple = ()) -> bool:
-    if self.in_progress.is_set():
-      return False
-    self.in_progress.set()
+    # Check-and-set under a lock: two concurrent requests could otherwise both see the flag clear
+    # and both start a job.
+    with self._start_lock:
+      if self.in_progress.is_set():
+        return False
+      self.in_progress.set()
     while not self.messages.empty():
       self.messages.get()
     self.latest_status.clear()
@@ -142,6 +149,42 @@ class SSEChannel:
 
 flash_channel = SSEChannel(idle_message='No flash in progress')
 download_channel = SSEChannel(idle_message='No download in progress')
+
+SLOT_LOCK = threading.Lock()
+"""
+  Held for the whole lifetime of any job that touches /data/update or the inactive slot's
+  partitions: a download (full or delta), a flash, or the inactive-slot version probe. Without it a
+  flash and a delta's base flash could dd the same partition at once, a download could truncate an
+  image a flash is still reading, and /update/version could mount the partition mid-dd.
+  A plain Lock (not RLock) on purpose: the endpoint acquires it and the worker thread releases it.
+"""
+
+# The UI starts /update/flash the moment a full download reports success, which can land a few
+# milliseconds before the download thread has released SLOT_LOCK. Wait this long for that handoff
+# before refusing.
+SLOT_LOCK_HANDOFF_TIMEOUT = 10
+
+
+@contextlib.contextmanager
+def _mounted(partition: int, readonly: bool = False):
+  """ Mount /dev/mmcblk0p{partition} on a fresh private mountpoint for the duration of the block.
+  Each operation gets its own directory, so nothing can unmount another operation's target out
+  from under it (the old shared /data/tmpmnt allowed exactly that). Read-only mounts use noload so
+  even an ext4 journal replay can't write to the partition. """
+  os.makedirs('/data', exist_ok=True)
+  mnt = tempfile.mkdtemp(prefix='slotmnt-', dir='/data')
+  opts = ['-o', 'ro,noload'] if readonly else []
+  try:
+    subprocess.run(['sudo', 'mount', *opts, f'/dev/mmcblk0p{partition}', mnt], check=True)
+    try:
+      yield mnt
+    finally:
+      subprocess.run(['sudo', 'umount', mnt], check=True)
+  finally:
+    try:
+      os.rmdir(mnt)
+    except OSError:
+      logger.warning(f'Could not remove mountpoint {mnt}')
 
 
 def validate_logging_ini():
@@ -368,20 +411,21 @@ def _read_inactive_slot_version() -> Optional[str]:
   active_slot = BootSlot.A if os.environ.get("BOOT_SLOT") == "A" else BootSlot.B
   inactive_slot = BootSlot.B if active_slot == BootSlot.A else BootSlot.A
 
-  mnt = "/data/tmpmnt"
+  # Never wait for, or interfere with, a download/flash in progress - the inactive slot may be
+  # mid-dd. inactive_version is informational only, so just report it as unknown meanwhile.
+  if not SLOT_LOCK.acquire(blocking=False):
+    return None
   try:
-    os.makedirs(mnt, exist_ok=True)
-    subprocess.run(["sudo", "umount", mnt], check=False)  # in case something's already there
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{inactive_slot.value.root}", mnt], check=True)
-    toml_content = subprocess.run(
-      ['sudo', 'cat', os.path.join(mnt, "home/pi/amplipi-dev/pyproject.toml")],
-      capture_output=True, text=True, check=True).stdout
+    with _mounted(inactive_slot.value.root, readonly=True) as mnt:
+      toml_content = subprocess.run(
+        ['sudo', 'cat', os.path.join(mnt, "home/pi/amplipi-dev/pyproject.toml")],
+        capture_output=True, text=True, check=True).stdout
     match = TOML_VERSION_STR.search(toml_content)
     return match.group(1) if match else None
   except Exception:
     return None
   finally:
-    subprocess.run(["sudo", "umount", mnt], check=False)
+    SLOT_LOCK.release()
 
 
 @router.get('/update/version')
@@ -473,7 +517,8 @@ class UpdateManifest(BaseModel):
     Schema for manifest.json.
 
     type FULL (the default, for back-compat with manifests written before delta releases existed):
-    a full root (+ optional boot) image release. `root` is required, `boot` is optional.
+    a full root + boot image release. Both `root` and `boot` are required, so a new root's
+    /lib/modules always ships with its matching kernel.
 
     type DELTA: an AmpliPi-code-only release applied via rsync against `version`'s own GitHub source
     tarball (see scripts/update/apply_delta_update), instead of a full image. `min_base_version` is
@@ -501,6 +546,10 @@ class UpdateManifest(BaseModel):
       raise ValueError('type DELTA requires min_base_version')
     if manifest_type == UpdateType.FULL and values.get('root') is None:
       raise ValueError('type FULL requires root')
+    # A root-only full update would leave the inactive slot's old kernel + config.txt paired with
+    # the new root's /lib/modules - a kernel/modules mismatch that can fail to boot or lose drivers.
+    if manifest_type == UpdateType.FULL and values.get('boot') is None:
+      raise ValueError('type FULL requires boot (root and boot must ship together so the kernel matches /lib/modules)')
     return values
 
 
@@ -593,10 +642,12 @@ class UpdateInfo(BaseModel):
 
 
 def update_thread(info: UpdateInfo):
+  """ SLOT_LOCK was acquired by start_update on this thread's behalf; released here. """
   try:
     _update_body(info)
   finally:
     download_channel.in_progress.clear()
+    SLOT_LOCK.release()
 
 
 def _update_body(info: UpdateInfo):
@@ -697,33 +748,26 @@ def _update_body(info: UpdateInfo):
     active_slot = BootSlot.A if os.environ.get("BOOT_SLOT") == "A" else BootSlot.B
     target_slot = BootSlot.B if active_slot == BootSlot.A else BootSlot.A
 
-    mnt = "/data/tmpmnt"
-    app_dir = os.path.join(mnt, "home/pi/amplipi-dev")
+    app_subdir = "home/pi/amplipi-dev"
 
     def read_target_version() -> Optional[str]:
       """
-        Mount target_slot's root just long enough to read its pyproject.toml version, then
-        unmount again.
+        Mount target_slot's root read-only just long enough to read its pyproject.toml version,
+        then unmount again.
 
         Returns None if the slot has no pyproject.toml at all (e.g. a progenitor image's slot B
         before its first-ever OTA). Treated as unconditionally below any min_base_version floor.
       """
-      if not os.path.exists(mnt):
-        os.mkdir(mnt)
-      subprocess.run(["sudo", "umount", mnt])  # in case something's already there
-      subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.root}", mnt], check=True)
-      try:
-        toml_path = os.path.join(app_dir, "pyproject.toml")
+      with _mounted(target_slot.value.root, readonly=True) as mnt:
+        toml_path = os.path.join(mnt, app_subdir, "pyproject.toml")
         if subprocess.run(['sudo', 'test', '-e', toml_path], check=False).returncode != 0:
           return None
         toml_content = subprocess.run(
           ['sudo', 'cat', toml_path], capture_output=True, text=True, check=True).stdout
-        match = TOML_VERSION_STR.search(toml_content)
-        if not match:
-          raise RuntimeError(f"Could not read a version from pyproject.toml on slot {target_slot.name}")
-        return match.group(1)
-      finally:
-        subprocess.run(["sudo", "umount", mnt], check=True)
+      match = TOML_VERSION_STR.search(toml_content)
+      if not match:
+        raise RuntimeError(f"Could not read a version from pyproject.toml on slot {target_slot.name}")
+      return match.group(1)
 
     current_version = read_target_version()
     needs_base_flash = manifest.min_base_version is not None and (
@@ -752,7 +796,12 @@ def _update_body(info: UpdateInfo):
         raise RuntimeError(f"Base version {base_tag} is not a full-image release - can't use it to bootstrap this delta")
 
       do_image_update(base_manifest)  # base_manifest.root/.boot already carry their own real urls
-      _flash_partition_body(tryboot=False, channel=download_channel)
+      # _flash_partition_body reports its own errors to the channel and returns False rather than
+      # raising - so check it, or a failed patch step (e2fsck/fstab/cmdline) would fall through
+      # to applying the delta and trybooting a slot whose root= or fstab may be wrong.
+      # standalone=False: the delta writes update-pending and reports done itself once applied.
+      if not _flash_partition_body(tryboot=False, channel=download_channel, standalone=False):
+        raise RuntimeError(f"Flashing base version {base_tag} failed - not applying the delta")
       # "continuing with delta to" is matched verbatim by update-ui.js's
       # ui_check_delta_phase_transition too - the paired signal that switches the bar back to
       # DELTA_PHASES. Same caveat as above if this message's wording changes.
@@ -768,9 +817,8 @@ def _update_body(info: UpdateInfo):
           f"Flashed base version {base_tag}, but slot {target_slot.name} now reports "
           f"{current_version or 'no image'} - still below {manifest.min_base_version}, refusing to continue")
 
-    subprocess.run(["sudo", "umount", mnt])  # in case something's already there
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.root}", mnt], check=True)
-    try:
+    with _mounted(target_slot.value.root) as mnt:
+      app_dir = os.path.join(mnt, app_subdir)
       download_channel.info(f'Slot {target_slot.name} is on {current_version}, applying delta to {manifest.version}...')
       script = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'scripts', 'update', 'apply_delta_update')
       # sudo: app_dir belongs to slot B's pi user, not necessarily writable by whoever this
@@ -789,13 +837,11 @@ def _update_body(info: UpdateInfo):
       proc.wait()
       if proc.returncode != 0:
         raise RuntimeError(f"apply_delta_update exited with code {proc.returncode}")
-    finally:
-      subprocess.run(["sudo", "umount", mnt], check=True)
 
     download_channel.info('Marking update pending...')
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.boot}", mnt], check=True)
-    subprocess.run(['sudo', 'tee', os.path.join(mnt, "update-pending")], input=str(target_slot.value.boot), text=True, check=True)
-    subprocess.run(["sudo", "umount", mnt], check=True)
+    with _mounted(target_slot.value.boot) as mnt:
+      subprocess.run(['sudo', 'tee', os.path.join(mnt, "update-pending")], input=str(target_slot.value.boot),
+                     text=True, check=True, stdout=subprocess.DEVNULL)
     # tryboot itself is triggered by the caller, after it reports success, not here.
 
   heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
@@ -852,7 +898,12 @@ def start_update(info: UpdateInfo):
     /data/update/ files (or inactive slot, for a delta) would corrupt each other.
   """
   # This endpoint uses the same pattern as /update/flash
+  if download_channel.in_progress.is_set():
+    return {'started': False, 'reason': 'an update is already in progress'}
+  if not SLOT_LOCK.acquire(timeout=SLOT_LOCK_HANDOFF_TIMEOUT):
+    return {'started': False, 'reason': 'a flash is in progress'}
   if not download_channel.start(target=update_thread, args=(info,)):
+    SLOT_LOCK.release()
     return {'started': False, 'reason': 'an update is already in progress'}
   return {'started': True}
 
@@ -888,14 +939,21 @@ def flash_partition_thread(tryboot: bool):
     _flash_partition_body(tryboot)
   finally:
     flash_channel.in_progress.clear()
+    SLOT_LOCK.release()  # acquired by start_flash on this thread's behalf
 
 
-def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
+def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel, standalone: bool = True) -> bool:
   """ channel defaults to flash_channel (the normal /update/flash case - the frontend watches
   that stream) but can be overridden - do_minimal_update's floor-check fallback passes
   download_channel instead, since that's the stream the frontend is actually watching during a
   /update/download/images-initiated delta update, and this function's progress would otherwise
-  silently go to a channel nobody's listening to for that flow. """
+  silently go to a channel nobody's listening to for that flow.
+
+  Caller must hold SLOT_LOCK. Errors are reported to `channel` rather than raised; the return
+  value says whether the flash fully succeeded, so callers chaining further work must check it.
+  standalone=False marks this as a sub-step of a larger job (a delta's base flash): it skips writing
+  update-pending and the terminal done() message, both of which the caller sends itself once the
+  whole job has succeeded - a done() here would make the UI treat the update as finished. """
   try:
     persist_logs_during_update()
   except Exception as e:
@@ -924,7 +982,36 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
     if dd.returncode != 0:
       raise RuntimeError(f'dd failed: {dd.stderr.read().decode()}')
 
-  def set_persist_logs():
+  def carry_over_identity(mnt: str):
+    """ An OTA root image was captured from a build unit, so it carries that unit's identity.
+    Replace it with this unit's own: the pi password hash (so SSH keeps working and the password
+    shown on the front display stays true), pi's authorized_keys (so no build-machine key ships,
+    and the customer's own keys survive), and /etc/machine-id (same physical unit, same id on both slots). """
+    active_shadow = subprocess.run(['sudo', 'cat', '/etc/shadow'], capture_output=True, text=True, check=True).stdout
+    pi_entry = next((line for line in active_shadow.splitlines() if line.startswith('pi:')), None)
+    if pi_entry is None:
+      raise RuntimeError('No pi entry in the active slot\'s /etc/shadow - refusing to guess a password')
+    target_shadow_path = os.path.join(mnt, 'etc/shadow')
+    target_shadow = subprocess.run(['sudo', 'cat', target_shadow_path], capture_output=True, text=True, check=True).stdout
+    lines = target_shadow.splitlines()
+    if not any(line.startswith('pi:') for line in lines):
+      raise RuntimeError('No pi entry in the new root\'s /etc/shadow')
+    lines = [pi_entry if line.startswith('pi:') else line for line in lines]
+    subprocess.run(['sudo', 'tee', target_shadow_path], input='\n'.join(lines) + '\n',
+                   text=True, check=True, stdout=subprocess.DEVNULL)
+
+    src_keys = '/home/pi/.ssh/authorized_keys'
+    dst_ssh = os.path.join(mnt, 'home/pi/.ssh')
+    dst_keys = os.path.join(dst_ssh, 'authorized_keys')
+    if subprocess.run(['sudo', 'test', '-f', src_keys], check=False).returncode == 0:
+      subprocess.run(['sudo', 'install', '-d', '-o', 'pi', '-g', 'pi', '-m', '700', dst_ssh], check=True)
+      subprocess.run(['sudo', 'install', '-o', 'pi', '-g', 'pi', '-m', '600', src_keys, dst_keys], check=True)
+    else:
+      subprocess.run(['sudo', 'rm', '-f', dst_keys], check=True)
+
+    subprocess.run(['sudo', 'cp', '/etc/machine-id', os.path.join(mnt, 'etc/machine-id')], check=True)
+
+  def set_persist_logs(mnt: str):
     """ persist logs after an update, set auto_off_delay to 14 unless the user's own delay is larger or 0 (no auto_off) """
     persist_logs = False
     auto_off_delay = 14
@@ -935,7 +1022,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
       persist_logs = state.get('persist_logs', False)
       auto_off_delay = state.get('auto_off_delay', 14)
 
-    dropin_path = '/data/tmpmnt' + JOURNALD_RASPI_CONF
+    dropin_path = mnt + JOURNALD_RASPI_CONF
     subprocess.run(['sudo', 'mkdir', '-p', os.path.dirname(dropin_path)], check=True)
     journald_config_content = (
       '# Created/managed by AmpliPi (also used by raspi-config)\n\n'
@@ -943,7 +1030,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
     )
     subprocess.run(['sudo', 'tee', dropin_path], input=journald_config_content, text=True, check=True)
 
-    log_path = '/data/tmpmnt/var/log/logging.ini'
+    log_path = mnt + '/var/log/logging.ini'
     existing_log = subprocess.run(['sudo', 'cat', log_path], capture_output=True, text=True).stdout
     logconf = configparser.ConfigParser(strict=False, allow_no_value=True)
     logconf.read_string(existing_log)
@@ -961,7 +1048,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
   # BOOT_SLOT is an env_var set by the active boot partition's commandline.txt
   if os.environ.get("BOOT_SLOT") != "A" and os.environ.get("BOOT_SLOT") != "B":
     channel.error("Boot slot could not be read")
-    return
+    return False
 
   active_slot = BootSlot.A if os.environ.get("BOOT_SLOT") == "A" else BootSlot.B
   target_slot = BootSlot.B if os.environ.get("BOOT_SLOT") == "A" else BootSlot.A
@@ -1034,7 +1121,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
       channel.info('All checks successful!')
     except Exception as e:
       channel.error(str(e))
-      return
+      return False
 
     # Congrats, everything is in place, you've survived this far, time to actually do anything at all
     try:
@@ -1052,7 +1139,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
         channel.info('Boot image flashed')
     except Exception as e:
       channel.error(f'Update failed mid-flash: {e}')
-      return
+      return False
   finally:
     # No more percentage-based progress after this point (patching is discrete step messages,
     # not a byte counter), so the heartbeat's job is done regardless of which path got here.
@@ -1060,30 +1147,30 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
     heartbeat_thread.join(timeout=3)
 
   try:
-    # /data/tmpmnt is the mountpoint used for whichever partition is being operated on at the time, either the inactive boot or root
+    # Each step mounts its partition on its own private mountpoint (see _mounted) - nothing else
+    # can unmount it mid-patch, and nothing else can mount the slot while SLOT_LOCK is held.
     # Necessary for making sure individual files have the proper details such as making sure the boot points to the correct root partition
     channel.info('Patching boot partition...')
-    if not os.path.exists("/data/tmpmnt"):
-      os.mkdir("/data/tmpmnt")
-    subprocess.run(["sudo", "umount", "/data/tmpmnt"])  # In case the user put something there
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.boot}", "/data/tmpmnt"], check=True)
+    with _mounted(target_slot.value.boot) as mnt:
+      # The captured boot image carries whatever label its source partition had when it was built,
+      # which isn't necessarily this slot's - relabel to match the slot actually being written here,
+      # so blkid/lsblk aren't misleading about which slot is which. Safe to run against a mounted
+      # vfat filesystem.
+      subprocess.run(["sudo", "fatlabel", f"/dev/mmcblk0p{target_slot.value.boot}", f"BOOT-{target_slot.name}"], check=True)
 
-    # The captured boot image carries whatever label its source partition had when it was built,
-    # which isn't necessarily this slot's - relabel to match the slot actually being written here,
-    # so blkid/lsblk aren't misleading about which slot is which. Safe to run against a mounted
-    # vfat filesystem.
-    subprocess.run(["sudo", "fatlabel", f"/dev/mmcblk0p{target_slot.value.boot}", f"BOOT-{target_slot.name}"], check=True)
-
-    # Uses subprocess + sudo cat/tee rather than open(...) as f: - these operations need higher
-    # privileges to touch a boot partition that doesn't belong to the user running this.
-    if manifest.boot is not None:
-      channel.info('Patching cmdline.txt')
-      content = subprocess.run(['sudo', 'cat', '/data/tmpmnt/cmdline.txt'], capture_output=True, text=True, check=True).stdout
-      # The image was collected from a system in our office, and it could've been slot A or slot B
-      # Make sure that the mappings are set correctly so there isn't a doubling of slots
-      content = re.sub(r'root=\S+', f'root=/dev/mmcblk0p{target_slot.value.root}', content)
-      content = re.sub(r'BOOT_SLOT=\S+', f'BOOT_SLOT={target_slot.name}', content)
-      subprocess.run(['sudo', 'tee', '/data/tmpmnt/cmdline.txt'], input=content, text=True, check=True)
+      # Uses subprocess + sudo cat/tee rather than open(...) as f: - these operations need higher
+      # privileges to touch a boot partition that doesn't belong to the user running this.
+      if manifest.boot is not None:
+        channel.info('Patching cmdline.txt')
+        cmdline_path = os.path.join(mnt, 'cmdline.txt')
+        content = subprocess.run(['sudo', 'cat', cmdline_path], capture_output=True, text=True, check=True).stdout
+        # The image was collected from a system in our office, and it could've been slot A or slot B
+        # Make sure that the mappings are set correctly so there isn't a doubling of slots
+        content = re.sub(r'root=\S+', f'root=/dev/mmcblk0p{target_slot.value.root}', content)
+        content = re.sub(r'BOOT_SLOT=\S+', f'BOOT_SLOT={target_slot.name}', content)
+        if f'root=/dev/mmcblk0p{target_slot.value.root}' not in content or f'BOOT_SLOT={target_slot.name}' not in content:
+          raise RuntimeError('cmdline.txt is missing root= or BOOT_SLOT= - refusing to tryboot an unbootable slot')
+        subprocess.run(['sudo', 'tee', cmdline_path], input=content, text=True, check=True, stdout=subprocess.DEVNULL)
 
     channel.info('Patching root partition...')
     # All systems originate from the same ancestor image. The following tools cleanse the root partition of identifiable info
@@ -1098,38 +1185,42 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
     # Relabel to match the slot actually being written, same as the boot partition above
     subprocess.run(["sudo", "e2label", f"/dev/mmcblk0p{target_slot.value.root}", f"ROOT-{target_slot.name}"], check=True)
 
-    subprocess.run(["sudo", "umount", "/data/tmpmnt"], check=True)
-
     channel.info('Patching root fstab...')
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.root}", "/data/tmpmnt"], check=True)
+    with _mounted(target_slot.value.root) as mnt:
+      # Mark the root with the slot letter so you know which partition you're in by simply running `ls`
+      slot_marker = os.path.join(mnt, f"home/pi/SLOT_{target_slot.name}")
+      subprocess.run(["sudo", "touch", slot_marker], check=True)
+      subprocess.run(["sudo", "chown", "pi:pi", slot_marker], check=True)
+      fstab_path = os.path.join(mnt, 'etc/fstab')
+      fstab = subprocess.run(['sudo', 'cat', fstab_path], capture_output=True, text=True, check=True).stdout
+      # The captured root image's fstab still has whatever device fields the source slot had at
+      # build time, unrelated to this slot - rewrite the /boot/firmware and / entries' device
+      # fields by mountpoint, unconditionally, to this slot's own device paths.
+      fstab = re.sub(r'^\S+(\s+/boot/firmware\s)', rf'/dev/mmcblk0p{target_slot.value.boot}\1', fstab, flags=re.MULTILINE)
+      fstab = re.sub(r'^\S+(\s+/\s)', rf'/dev/mmcblk0p{target_slot.value.root}\1', fstab, flags=re.MULTILINE)
+      subprocess.run(['sudo', 'tee', fstab_path], input=fstab, text=True, check=True, stdout=subprocess.DEVNULL)
 
-    # Mark the root with the slot letter so you know which partition you're in by simply running `ls`
-    subprocess.run(["sudo", "touch", f"/data/tmpmnt/home/pi/SLOT_{target_slot.name}"], check=True)
-    subprocess.run(["sudo", "chown", "pi:pi", f"/data/tmpmnt/home/pi/SLOT_{target_slot.name}"], check=True)
-    fstab = subprocess.run(['sudo', 'cat', '/data/tmpmnt/etc/fstab'], capture_output=True, text=True, check=True).stdout
-    # The captured root image's fstab still has whatever device fields the source slot had at
-    # build time, unrelated to this slot - rewrite the /boot/firmware and / entries' device
-    # fields by mountpoint, unconditionally, to this slot's own device paths.
-    fstab = re.sub(r'^\S+(\s+/boot/firmware\s)', rf'/dev/mmcblk0p{target_slot.value.boot}\1', fstab, flags=re.MULTILINE)
-    fstab = re.sub(r'^\S+(\s+/\s)', rf'/dev/mmcblk0p{target_slot.value.root}\1', fstab, flags=re.MULTILINE)
-    subprocess.run(['sudo', 'tee', '/data/tmpmnt/etc/fstab'], input=fstab, text=True, check=True)
+      channel.info('Carrying over this unit\'s password, SSH keys and machine-id...')
+      carry_over_identity(mnt)
 
-    channel.info('Applying persist-logs preference...')
-    set_persist_logs()
+      channel.info('Applying persist-logs preference...')
+      set_persist_logs(mnt)
 
-    subprocess.run(["sudo", "umount", "/data/tmpmnt"], check=True)
+    if not standalone:
+      # Sub-step of a delta update: the caller writes update-pending and reports completion itself.
+      return True
 
     # Always written last as this is what causes the amplipi-tryboot-verify.sh and amplipi-boot-deadline.sh
     # services to validate the slot on next boot
     # If this is written on an update that later fails, there could be odd behaviors on next reboot
     channel.info('Marking update pending...')
-    subprocess.run(["sudo", "mount", f"/dev/mmcblk0p{target_slot.value.boot}", "/data/tmpmnt"], check=True)
-    subprocess.run(['sudo', 'tee', '/data/tmpmnt/update-pending'], input=str(target_slot.value.boot), text=True, check=True)
-    subprocess.run(["sudo", "umount", "/data/tmpmnt"], check=True)
+    with _mounted(target_slot.value.boot) as mnt:
+      subprocess.run(['sudo', 'tee', os.path.join(mnt, 'update-pending')], input=str(target_slot.value.boot),
+                     text=True, check=True, stdout=subprocess.DEVNULL)
 
   except Exception as e:
     channel.error(f'Update failed post-flash: {e}')
-    return
+    return False
 
   if tryboot:
     channel.info('Triggering tryboot...')
@@ -1137,6 +1228,7 @@ def _flash_partition_body(tryboot: bool, channel: SSEChannel = flash_channel):
   if tryboot:
     time.sleep(2)
     subprocess.Popen(['sudo', 'reboot', '0 tryboot'])
+  return True
 
 
 @router.post('/update/flash')
@@ -1153,7 +1245,15 @@ def start_flash(tryboot: bool = False):
   staged_manifest = _load_manifest("/data/update/manifest.json")
   has_boot = staged_manifest is not None and staged_manifest.boot is not None
 
+  if flash_channel.in_progress.is_set():
+    return {'started': False, 'reason': 'a flash is already in progress', 'has_boot': has_boot}
+  # A download (full or delta) holds SLOT_LOCK for its whole run - including a delta's own base
+  # flash of this same partition - so this refuses to dd underneath it. The timeout only covers the
+  # normal handoff where the UI calls this the instant a full download reports success.
+  if not SLOT_LOCK.acquire(timeout=SLOT_LOCK_HANDOFF_TIMEOUT):
+    return {'started': False, 'reason': 'a download or update is in progress', 'has_boot': has_boot}
   if not flash_channel.start(target=flash_partition_thread, args=(tryboot,)):
+    SLOT_LOCK.release()
     return {'started': False, 'reason': 'a flash is already in progress', 'has_boot': has_boot}
   return {'started': True, 'has_boot': has_boot}
 

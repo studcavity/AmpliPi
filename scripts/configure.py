@@ -91,6 +91,10 @@ _os_deps: Dict[str, Dict[str, Any]] = {
                 'redis',                       # background job queue
                 # pygobject dependencies (Spotifyd)
                 'libgirepository1.0-dev', 'libcairo2-dev',
+                # The app venv is built from the OS's own Python 3.13 (scripts/install_python_deps.bash);
+                # -dev + build tools compile the few deps with no aarch64 wheel (RPi.GPIO, spidev,
+                # PyGObject, dbus-python).
+                'python3-venv', 'python3-dev', 'build-essential', 'pkg-config', 'libdbus-1-dev',
                 ],
     },
     'updates': {
@@ -384,9 +388,6 @@ _os_deps: Dict[str, Dict[str, Any]] = {
             '/opt/support_tunnel/venv/bin/pip install -r requirements.txt',
             'popd',
         ]
-    },
-    'poetry': {
-      'script': ['curl -sSL https://install.python-poetry.org | python3 -']
     },
     # streams
     # TODO: can stream dependencies be aggregated from the streams themselves?

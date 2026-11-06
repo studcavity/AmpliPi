@@ -1439,6 +1439,8 @@ class Api:
 
   def play_media(self, media: models.PlayMedia) -> ApiResponse:
     """Play media to a file player on a specified source"""
+    if media.source_id is None:
+      return ApiResponse.error('play_media requires a source_id')
     stream = None
     # First, check if we already have a media player here
     t_stream = self.get_stream(sid=media.source_id)

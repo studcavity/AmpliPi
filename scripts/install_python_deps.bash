@@ -1,22 +1,26 @@
 #!/bin/bash
 # Helper script for configure.py
+#
+# Uses the OS's own Python (Debian Trixie / Raspberry Pi OS Trixie ship 3.13) and its venv + pip,
+# so nothing gets piped from the internet into a shell and the interpreter is pinned by the OS
+# image itself. python3-venv and python3-dev (headers for the few packages that build from source,
+# e.g. RPi.GPIO, spidev, PyGObject, dbus-python) are installed by configure.py's base os deps.
 
 set -e
 cd "$( dirname "$0" )"/..
 
 VENV=/home/pi/amplipi-dev/venv
-TARGET_PYTHON=3.8
+TARGET_PYTHON=3.13
+PYTHON=/usr/bin/python${TARGET_PYTHON}
 
-export PATH="$HOME/.local/bin:$PATH"
-
-if ! command -v uv &>/dev/null; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+if [[ ! -x $PYTHON ]]; then
+  echo "ERROR: $PYTHON not found - this release expects Raspberry Pi OS / Debian Trixie (Python $TARGET_PYTHON)"
+  exit 1
 fi
 
 # Rebuild the venv if it's missing, or if it exists but isn't running the target Python version -
-# e.g. a venv left over from testing a different branch pinned to a different Python. Without this
-# check, uv pip install below would silently install today's packages into a stale interpreter
-# instead of failing loudly, since it only cares that $VENV/bin/python exists.
+# e.g. the Python 3.8 venv uv created on earlier Trixie builds. Without this check, pip install
+# below would silently install into a stale interpreter instead of failing loudly.
 current_python=""
 if [[ -e $VENV/bin/python ]]; then
   current_python=$($VENV/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
@@ -25,15 +29,15 @@ if [[ ! -d $VENV ]] || [[ ! -e $VENV/bin/python ]] || [[ "$current_python" != "$
   echo ""
   if [[ -n "$current_python" && "$current_python" != "$TARGET_PYTHON" ]]; then
     echo "Existing virtual environment is Python $current_python, rebuilding for Python $TARGET_PYTHON"
-    rm -rf "$VENV"
   else
     echo "Setting up virtual environment"
   fi
-  # --clear: uv refuses to write into a pre-existing directory otherwise, even an empty one
-  uv venv $VENV --python $TARGET_PYTHON --clear
+  rm -rf "$VENV"
+  $PYTHON -m venv "$VENV"
 fi
 
-# uv pip bypasses PEP 668 (Trixie blocks system pip) and doesn't require pip in the venv
-uv pip install --python $VENV/bin/python -r requirements.txt
+# Inside a venv, Trixie's PEP 668 "externally managed" block doesn't apply.
+$VENV/bin/python -m pip install --upgrade --disable-pip-version-check -q 'pip==25.2'
+$VENV/bin/python -m pip install --disable-pip-version-check -r requirements.txt
 
 echo "install python deps complete!"

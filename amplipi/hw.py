@@ -35,6 +35,8 @@ from smbus2 import SMBus
 from amplipi import formatter
 from amplipi import utils
 
+# GPIO is only importable (and only used) on real AmpliPi hardware.
+# pylint: disable=possibly-used-before-assignment
 if utils.is_amplipi():
   from RPi import GPIO
 

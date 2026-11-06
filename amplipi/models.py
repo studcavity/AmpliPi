@@ -991,8 +991,8 @@ class PlayMedia(BaseModel):
   media: str = Field(description="URL to media to play")
   vol: Optional[int] = Field(default=None, ge=MIN_VOL_DB, le=MAX_VOL_DB,
                              description='Output volume in dB, overrides vol_f')
-  vol_f: float = Field(default=None, ge=MIN_VOL_F, le=MAX_VOL_F, description="Output Volume (float)")
-  source_id: int = Field(default=None, ge=0, le=MAX_SOURCES - 1, description='Source to play media with')
+  vol_f: Optional[float] = Field(default=None, ge=MIN_VOL_F, le=MAX_VOL_F, description="Output Volume (float)")
+  source_id: Optional[int] = Field(default=None, ge=0, le=MAX_SOURCES - 1, description='Source to play media with')
 
   class Config:
     schema_extra = {
@@ -1063,7 +1063,7 @@ class Info(BaseModel):
   latest_release: str = Field(default='unknown', description='Latest software release available from GitHub')
   access_key: str = Field(default='', description='session token/API key used for authentication')
   lms_mode: bool = Field(default=False, description='Are we running in LMS mode?')
-  serial: str = Field(default=False, description='Serial Number of this AmpliPi')
+  serial: str = Field(default='', description='Serial Number of this AmpliPi')
   expanders: List[str] = Field(default=[], description='Serial Numbers of any expanders connected to this AmpliPi')
   fw: List[FirmwareInfo] = Field(
     default=[], description='firmware information for each connected controller or expansion unit')

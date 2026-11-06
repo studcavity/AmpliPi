@@ -331,7 +331,8 @@ class ExitHandler:
         pass
 
       try:
-        if self._ap.available() and self._ap.load_config(old_config):
+        # old_config is the module-level global set in __main__ below
+        if self._ap.available() and self._ap.load_config(old_config):  # pylint: disable=possibly-used-before-assignment
           print('Restored previous configuration.')
         else:
           print('Failed to restore configuration. Left in testing state.')

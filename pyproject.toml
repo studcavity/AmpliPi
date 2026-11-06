@@ -22,7 +22,7 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.7",
-  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.9",
   "Topic :: Multimedia :: Sound/Audio :: Players",
 ]
@@ -58,6 +58,11 @@ pytest = "^6.2.2"
 
 [tool.pylint.'MESSAGES CONTROL']
 extension-pkg-whitelist = "pydantic"
+
+[tool.mypy]
+# Needed by mypy >= 1.x to understand pydantic v1 models (otherwise every optional field
+# reports as a missing call argument).
+plugins = ["pydantic.mypy"]
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

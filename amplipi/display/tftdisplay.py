@@ -313,6 +313,7 @@ class TFTDisplay(Display):
         if connected:
           if ip_str == 'Disconnected from network.':
             status = DisplayError.NO_IP
+            expanders = 0  # was unset on this path, so the expanders check below raised NameError
           else:
             status, _, expanders = get_status(self.API_URL, no_serial_ok=True, emoji=True, max_length=40)
 

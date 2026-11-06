@@ -53,3 +53,7 @@ max-line-length=120
 # Exceptions that will emit a warning when being caught. Defaults to
 # "Exception".
 overgeneral-exceptions=
+
+[TYPECHECK]
+# netifaces-plus re-exports its C extension via `from _netifaces import *`, which pylint can't follow.
+ignored-modules=netifaces

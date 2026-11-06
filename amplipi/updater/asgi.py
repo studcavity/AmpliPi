@@ -723,7 +723,6 @@ def _update_body(info: UpdateInfo):
     if manifest.boot is not None:
       download_asset(manifest.boot.url, os.path.join(dest_dir, "boot.img.xz"), "Downloading boot image")
 
-
   heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
   heartbeat_thread.start()
   try:

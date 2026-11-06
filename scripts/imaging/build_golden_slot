@@ -244,10 +244,12 @@ fi
 sudo mkdir -p "$WORKDIR/target-root/etc/ssh/sshd_config.d"
 echo "PerSourcePenalties authfail:1 max:30 min:5" | sudo tee "$WORKDIR/target-root/etc/ssh/sshd_config.d/ssh_penalties.conf" >/dev/null
 
+# panic=10: reboot (and so roll back a trial slot) 10s after a kernel panic or a failed initramfs
+# root mount, instead of hanging until someone power-cycles the unit.
 # root= uses a direct device path, not PARTUUID=: the /dev/disk/by-partuuid symlinks are
 # unreliable on this hardware and can slip between slots. This file is already slot-specific, so
 # a hardcoded /dev/mmcblk0pN carries exactly as much information as a PARTUUID would.
-echo "console=tty1 root=/dev/mmcblk0p${ROOT_PART} rootfstype=ext4 rootwait fsck.repair=yes systemd.setenv=BOOT_SLOT=${SLOT}" \
+echo "console=tty1 root=/dev/mmcblk0p${ROOT_PART} rootfstype=ext4 rootwait fsck.repair=yes panic=10 systemd.setenv=BOOT_SLOT=${SLOT}" \
   | sudo tee "$WORKDIR/target-boot/cmdline.txt" >/dev/null
 
 echo "Configuring root-$SLOT"

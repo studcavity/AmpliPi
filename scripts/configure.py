@@ -140,6 +140,23 @@ _os_deps: Dict[str, Dict[str, Any]] = {
           'to': '/etc/systemd/system/amplipi-boot-deadline.service',
           'sudo': 'true',
         },
+        # Hangs before amplipi-boot-deadline can run (kernel panic, initramfs failure, emergency
+        # mode, a wedged PID 1) must reboot too - see the comments in each file.
+        {
+          'from': 'config/systemd/amplipi-watchdog.conf',
+          'to': '/etc/systemd/system.conf.d/amplipi-watchdog.conf',
+          'sudo': 'true',
+        },
+        {
+          'from': 'config/systemd/emergency-reboot.conf',
+          'to': '/etc/systemd/system/emergency.service.d/amplipi-reboot.conf',
+          'sudo': 'true',
+        },
+        {
+          'from': 'config/systemd/emergency-reboot.conf',
+          'to': '/etc/systemd/system/rescue.service.d/amplipi-reboot.conf',
+          'sudo': 'true',
+        },
       ],
       'script': [
         'sudo chmod +x /usr/local/bin/amplipi-tryboot-verify.sh',
@@ -161,6 +178,13 @@ _os_deps: Dict[str, Dict[str, Any]] = {
 
         'sudo chmod 444 /etc/systemd/system/amplipi-boot-deadline.service',
         'sudo systemctl enable amplipi-boot-deadline.service',
+
+        # panic=10: reboot 10s after a kernel panic, and initramfs-tools reboots instead of
+        # dropping to its shell when it can't mount root. build_golden_slot writes this into new
+        # slots' cmdline.txt; this covers units deployed before that.
+        '[ ! -f /boot/firmware/cmdline.txt ] || grep -qw "panic=[0-9]*" /boot/firmware/cmdline.txt '
+        '|| sudo sed -i "1 s/\\s*$/ panic=10/" /boot/firmware/cmdline.txt',
+        'sudo systemctl daemon-reload',
       ],
     },
     'usb': {

@@ -57,6 +57,7 @@ max_framebuffers=2
 
 [all]
 enable_uart=1
+dtparam=watchdog=on # hardware watchdog for systemd RuntimeWatchdogSec (config/systemd/amplipi-watchdog.conf)
 gpio=4=op,dh # Preamp RESET pin
 gpio=5=op,dl # Preamp BOOT0 pin
 
